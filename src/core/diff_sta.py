@@ -13,8 +13,14 @@ def smooth_max_lse(arrival_times, gamma=0.01):
     返回:
     Tensor: 平滑后的最大到达时间 (标量 Tensor)
     """
-    if not arrival_times:
-        # 如果没有输入，默认到达时间为 0
+    # if not arrival_times:
+    #     # 如果没有输入，默认到达时间为 0
+    #     return torch.tensor(0.0, dtype=torch.float32, requires_grad=True)
+    
+    # 【修复】：安全地判断传入的是空列表还是空张量
+    if isinstance(arrival_times, list) and len(arrival_times) == 0:
+        return torch.tensor(0.0, dtype=torch.float32, requires_grad=True)
+    elif torch.is_tensor(arrival_times) and arrival_times.numel() == 0:
         return torch.tensor(0.0, dtype=torch.float32, requires_grad=True)
         
     if isinstance(arrival_times, list):

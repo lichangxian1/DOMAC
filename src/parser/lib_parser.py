@@ -168,6 +168,9 @@ class NLDMParser:
                     idx1 = tables['cell_rise']['index_1']
                     idx2 = tables['cell_rise']['index_2']
                     
+                    assert np.allclose(idx1, tables['cell_fall']['index_1']), "Rise 和 Fall 的 Slew 坐标系未对齐，不能直接 np.maximum！"
+                    assert np.allclose(idx2, tables['cell_fall']['index_2']), "Rise 和 Fall 的 Load 坐标系未对齐！"
+
                     # 取 Worst-case Delay 
                     delay_worst = np.maximum(tables['cell_rise']['values'], tables['cell_fall']['values'])
                     # 取 Worst-case Slew 

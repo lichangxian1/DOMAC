@@ -49,6 +49,50 @@ def create_physical_tensor_mock():
     
     return [fa_tensors, ha_tensors]
 
+def generate_multiplier_canvas(bit_width):
+    """
+    [动态画布生成器]
+    根据乘法器位宽，自动利用数学规律推演 PP 的列分布，
+    并预估所需的最多压缩器 (Compressor) 坑位。
+    """
+    print(f"\n[Canvas Generator] 正在自动推演 {bit_width}x{bit_width} 乘法器画布...")
+    
+    # ================= 1. 自动生成部分积 (PP) 点阵 =================
+    pp_cols = []
+    max_cols = bit_width * 2 - 1
+    dots_in_col = [0] * max_cols
+    
+    # N x N 无符号阵列乘法器的数学规律：第 i 行和第 j 列的 PP，属于第 i+j 列
+    for i in range(bit_width):
+        for j in range(bit_width):
+            col = i + j
+            pp_cols.append(col)
+            dots_in_col[col] += 1
+            
+    print(f" -> 推演完毕: 共 {len(pp_cols)} 个 PP 节点。各列点数分布: {dots_in_col}")
+    
+    # ================= 2. 自动申请压缩器 (Compressor) 预算 =================
+    comp_cols = []
+    current_dots = list(dots_in_col)
+    
+    # 我们用一个贪心模拟器来预估“最大坑位需求”
+    # 只要某一列的信号多于 2 个（加法器吃不下），我们就必须向 PyTorch 申请一个压缩器坑位
+    for col in range(max_cols):
+        while current_dots[col] > 2:
+            comp_cols.append(col) # 在这一列放置一个压缩器画布
+            
+            # 假设我们用最吃性能的全加器 (FA) 来模拟最悲观的压缩
+            current_dots[col] -= 3  # FA 吃掉本列 3 个点
+            current_dots[col] += 1  # 吐出一个 Sum (留在本列)
+            
+            if col + 1 < max_cols:
+                current_dots[col + 1] += 1 # 吐出一个 Carry (去往下一列)
+                
+    print(f" -> 预算申请完毕: 需向 PyTorch 张量申请 {len(comp_cols)} 个压缩器画布。")
+    print(f" -> 画布列分布: {comp_cols}")
+    
+    return sorted(pp_cols), sorted(comp_cols)
+
 def main():
     print("="*60)
     print(" [DOMAC 净室复现] TSMC 28nm 节点可微 STA 优化框架")
@@ -76,25 +120,27 @@ def main():
 
     # 2. 硬件架构超参数定义
     # ================= [新增算术拓扑定义] =================
-    # 我们模拟一个真实的乘法器部分积列分布 (例如 8个PP，分布在 0~3 列)
-    PP_COLS = [0, 0, 1, 1, 1, 2, 2, 3] 
+    # # 我们模拟一个真实的乘法器部分积列分布 (例如 8个PP，分布在 0~3 列)
+    # PP_COLS = [0, 0, 1, 1, 1, 2, 2, 3] 
     
-    # 我们投放 6 个压缩器坑位，预先分配给对应的列去处理
-    COMP_COLS = [0, 1, 1, 2, 2, 3]
-    
+    # # 我们投放 6 个压缩器坑位，预先分配给对应的列去处理
+    # COMP_COLS = [0, 1, 1, 2, 2, 3]
+
+# ================= 在 main.py 中的调用方式 =================
+# 你只需要修改这一行！想综合几位宽的乘法器，就填几！
+    BIT_WIDTH = 8  
+
+    PP_COLS, COMP_COLS = generate_multiplier_canvas(BIT_WIDTH)
     NUM_PP = len(PP_COLS)
     NUM_COMPRESSORS = len(COMP_COLS)
+
     
     # 打破时序对称性死锁！为不同的 PP 注入 0.0 到 0.1ns 的到达时间阶梯
     pp_at = torch.linspace(0.0, 0.1, NUM_PP) 
     pp_slew = torch.full((NUM_PP,), 0.05)
     # ========================================================
-    REQ_TIME = 0.1 # 约束时间 0.5ns (500ps)
+    REQ_TIME = 0.02 # 约束时间 0.5ns (500ps)
     
-    # 初始化部分积的到达时间和转换时间 (全0起步)
-    pp_at = torch.zeros(NUM_PP, dtype=torch.float32)
-    pp_slew = torch.full((NUM_PP,), 0.01, dtype=torch.float32)
-
     # 3. 实例化 DOMAC 核心引擎
     print(f"\n[Engine] 正在构建可微压缩树 (PP={NUM_PP}, Compressors={NUM_COMPRESSORS})...")
     # model = DOMAC_CompressorTree(
@@ -131,20 +177,19 @@ def main():
     print("\n离散化后的内部布线拓扑 (M矩阵，仅包含 0 和 1):")
     print(discrete_M)
     
-    # 物理合法性终极断言
+# 物理合法性终极断言
     print("\n[物理规则终极断言]")
-    col_sums = torch.sum(discrete_M, dim=0).tolist()
-    for j, (p_type, actual_pins) in enumerate(zip(discrete_P, col_sums)):
+    # 【修复】：将 18 列按照 (6台压缩器, 3个引脚) 重新划分，并在引脚维度求和
+    col_sums_tensor = torch.sum(discrete_M, dim=0).view(NUM_COMPRESSORS, 3) 
+    actual_pins_per_c = torch.sum(col_sums_tensor, dim=1).tolist()
+    
+    for j, (p_type, actual_pins) in enumerate(zip(discrete_P, actual_pins_per_c)):
         expected = 3 if p_type == 0 else 2
         print(f"压缩器 {j}: 类型={'FA' if p_type==0 else 'HA'} -> 需要引脚: {expected}, 实际连线数: {int(actual_pins)} " + 
               (" [合法] ✓" if expected == actual_pins else " [非法] ❌"))
-    
-    # === 将以下代码加在 "[物理规则终极断言]" 的 for 循环之后 ===
-    
+              
     from src.export.verilog_gen import VerilogGenerator
-    
     v_gen = VerilogGenerator(num_pp=NUM_PP, num_c=NUM_COMPRESSORS)
-    # 调用生成器，将张量彻底转化为硅基语言
     v_gen.generate(discrete_M, discrete_P, output_file="output/netlists/domac_result.v")
 
     end_time = time.time()

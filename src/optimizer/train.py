@@ -66,7 +66,7 @@ class DOMACTrainer:
             self.optimizer.step()
             
             # 6. 工程监控打印 (每 20 步打印一次核心指标)
-            if epoch % 20 == 0 or epoch == max_epochs - 1:
+            if epoch % 5 == 0 or epoch == max_epochs - 1:
                 print(f"Epoch {epoch:03d} | "
                       f"WNS: {loss_dict['wns'].item():.4f} | "
                       f"Area: {loss_dict['area'].item():.4f} | "
