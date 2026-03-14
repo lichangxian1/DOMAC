@@ -53,8 +53,8 @@ def diff_bilinear_interp(slew, load, index_1_slew, index_2_load, lut_values):
     """
     # 1. 物理边界硬性截断 (Clamp)
     # 防止优化过程中产生的异常负载或 Slew 导致查表越界。Clamp 边界处的梯度为0，符合物理极限。
-    x = torch.clamp(slew, min=index_1_slew[0], max=index_1_slew[-1])
-    y = torch.clamp(load, min=index_2_load[0], max=index_2_load[-1])
+    # x = torch.clamp(slew, min=index_1_slew[0], max=index_1_slew[-1])
+    # y = torch.clamp(load, min=index_2_load[0], max=index_2_load[-1])
     
     # 2. 定位坐标区间 (searchsorted 本身不产生梯度，我们依靠权重的代数运算产生梯度)
     idx_x = torch.searchsorted(index_1_slew, x)
@@ -119,7 +119,9 @@ def compute_expected_timing(p_c, cell_tensors_dict, in_pin, out_pin, slew, load)
         
         if arc_data is None:
             # 如果没有这条时序弧 (例如 HA 可能没有 CI 到 CO 的弧)
-            continue
+            # continue
+            delay = torch.tensor(10.0, dtype=torch.float32, device=p_c.device)
+            out_slew = torch.tensor(10.0, dtype=torch.float32, device=p_c.device)
             
         # 可微查表
         delay = diff_bilinear_interp(
