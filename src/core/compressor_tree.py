@@ -4,122 +4,182 @@ import torch.nn.functional as F
 from .diff_sta import smooth_max_lse, diff_bilinear_interp
 
 class DOMAC_CompressorTree(nn.Module):
-    def __init__(self, pp_cols, c_cols, cell_tensors, req_time):
+    def __init__(self, pp_cols, c_cols, fa_tensors, ha_tensors, c_types, req_time):
+        """
+        DOMAC 压缩树核心引擎 (Dr. Gemini 终极重构版)
+        :param fa_tensors: 全加器 (FA) 的所有可用物理实现列表
+        :param ha_tensors: 半加器 (HA) 的所有可用物理实现列表
+        :param c_types: 预先分配的压缩器类型列表，例如 ['FA', 'FA', 'HA']
+        """
         super(DOMAC_CompressorTree, self).__init__()
         
         self.pp_cols = pp_cols
         self.c_cols = c_cols
         self.num_pp = len(pp_cols)
         self.num_c = len(c_cols)
+        self.c_types = c_types
         
-        # [Dr. Gemini 核心修正 1]: 物理节点扩容！每个压缩器有 S 和 CO 两个输出节点
+        # 物理节点扩容 (S 和 CO 独立输出)
         self.s_cols = c_cols
-        self.co_cols = [col + 1 for col in c_cols] # 进位必定去往下一列 (权重视为 2^(i+1))
-        
-        # 总节点数 = PP数量 + S节点数量 + CO节点数量
+        self.co_cols = [col + 1 for col in c_cols] 
         self.node_cols = list(self.pp_cols) + list(self.s_cols) + list(self.co_cols)
         total_nodes = len(self.node_cols)
         
-        self.num_impls = len(cell_tensors) 
+        # 异构物理库对齐
+        self.num_fa_impls = len(fa_tensors) # FA的种类数
+        self.num_ha_impls = len(ha_tensors) # HA的种类数
+        self.max_impls = max(self.num_fa_impls, self.num_ha_impls) # 最大实现数，用于统一 Logits 维度
         self.req_time = req_time
         
         self.pin_names = ['A', 'B', 'CI']
         self.num_pins_per_c = len(self.pin_names)
         
-        self.cell_arcs = []
-        self.pin_caps = []
-        self.cell_areas = []
+        # 预解析 FA 和 HA 物理库
+        self.fa_areas, self.fa_caps, self.fa_arcs = self._parse_tensors(fa_tensors)
+        self.ha_areas, self.ha_caps, self.ha_arcs = self._parse_tensors(ha_tensors)
         
-        for cell_idx, ct in enumerate(cell_tensors):
-            self.cell_areas.append(ct.get('cell_area', 1.0))
-            
-            p_caps = []
-            for p_name in self.pin_names:
-                p_caps.append(ct.get('pin_cap', {}).get(p_name, 0.001))
-            self.pin_caps.append(p_caps)
-            
-            arcs = {'S': {}, 'CO': {}}
-            for in_p in self.pin_names:
-                # [Dr. Gemini 核心修正 1]: 同时提取 S 和 CO 的时序弧
-                arc_s = ct.get('S', {}).get(in_p)
-                arc_co = ct.get('CO', {}).get(in_p)
-                if arc_s is not None: arcs['S'][in_p] = arc_s
-                if arc_co is not None: arcs['CO'][in_p] = arc_co
-            self.cell_arcs.append(arcs)
-            
-        self.area_lib = torch.tensor(self.cell_areas, dtype=torch.float32)
-        self.pin_caps_lib = torch.tensor(self.pin_caps, dtype=torch.float32)
+        # 统一维度的选择概率 Logits
+        self.p_logits = nn.Parameter(torch.zeros(self.num_c, self.max_impls))
         
-        self.p_logits = nn.Parameter(torch.zeros(self.num_c, self.num_impls))
+        # 构建物理实现掩码与引脚映射掩码
+        p_mask = torch.zeros(self.num_c, self.max_impls)
+        active_pin_mask = torch.zeros(self.num_c * self.num_pins_per_c)
+        
+        for j, c_type in enumerate(self.c_types):
+            if c_type == 'FA':
+                p_mask[j, self.num_fa_impls:] = float('-inf')
+                active_pin_mask[j*3 : j*3+3] = 1.0 # FA 需要 3 个输入
+            else: # HA
+                p_mask[j, self.num_ha_impls:] = float('-inf')
+                active_pin_mask[j*3 : j*3+2] = 1.0 # HA 只要 2 个输入
+                active_pin_mask[j*3+2] = 0.0       # 封死 CI 引脚
+                
+        # 注册为 buffer，确保在 device 迁移时自动同步，但不参与梯度更新
+        self.register_buffer('p_mask', p_mask)
+        self.register_buffer('active_pin_mask', active_pin_mask)
         
         total_target_pins = self.num_c * self.num_pins_per_c 
         self.m_logits = nn.Parameter(torch.zeros(total_nodes, total_target_pins + 1))
         
-        # ================= [Dr. Gemini 核心修正 1]: 严格的 DAG 物理掩码 =================
-        self.dag_mask = torch.full((total_nodes, total_target_pins + 1), float('-inf'))
+        # 构建严格的 DAG 拓扑掩码
+        dag_mask = torch.full((total_nodes, total_target_pins + 1), float('-inf'))
         for i in range(total_nodes):
             for j in range(self.num_c):
-                # 判断当前节点 i 是否在压缩器 j 之前 (防止组合逻辑环)
+                # 防止组合逻辑环
                 if i < self.num_pp:
-                    is_downstream = True # PP 永远在最上游
+                    is_downstream = True
                 elif i < self.num_pp + self.num_c:
-                    is_downstream = (i - self.num_pp) < j # S 节点
+                    is_downstream = (i - self.num_pp) < j
                 else:
-                    is_downstream = (i - self.num_pp - self.num_c) < j # CO 节点
+                    is_downstream = (i - self.num_pp - self.num_c) < j
 
-                # 严格的列对齐约束：信号只能连给同一列的压缩器引脚
                 is_same_column = (self.node_cols[i] == self.c_cols[j])
                 
                 if is_downstream and is_same_column:
                     for p_idx in range(self.num_pins_per_c):
-                        self.dag_mask[i, j * self.num_pins_per_c + p_idx] = 0.0
+                        # 只有存在这个引脚 (active_pin_mask == 1) 才允许连线
+                        if self.active_pin_mask[j * 3 + p_idx] > 0.5:
+                            dag_mask[i, j * self.num_pins_per_c + p_idx] = 0.0
                         
-            # 所有节点都允许连接到外部 Sink (作为最终加法器 CPA 的输入)
-            self.dag_mask[i, total_target_pins] = 0.0 
+            # 外部输出通道 (Sink) 永远畅通
+            dag_mask[i, total_target_pins] = 0.0 
+            
+        self.register_buffer('dag_mask', dag_mask)
 
+# 物理库解析器：将原始物理库 Tensor 转换为训练友好的格式
+    def _parse_tensors(self, tensors):
+        areas, caps, arcs = [], [], []
+        for ct in tensors:
+            areas.append(ct.get('cell_area', 1.0))
+            p_caps = [ct.get('pin_cap', {}).get(p, 0.001) for p in self.pin_names]
+            caps.append(p_caps)
+            
+            arc_dict = {'S': {}, 'CO': {}}
+            for in_p in self.pin_names:
+                arc_s = ct.get('S', {}).get(in_p)
+                arc_co = ct.get('CO', {}).get(in_p)
+                if arc_s: arc_dict['S'][in_p] = arc_s
+                if arc_co: arc_dict['CO'][in_p] = arc_co
+            arcs.append(arc_dict)
+        return torch.tensor(areas, dtype=torch.float32), torch.tensor(caps, dtype=torch.float32), arcs
+
+# 前向传播：核心的可微 STA 计算逻辑
     def forward(self, pp_at, pp_slew):
-        P_c = F.softmax(self.p_logits, dim=-1) 
+        # 1. 施加异构物理掩码
+        P_c = F.softmax(self.p_logits + self.p_mask, dim=-1) 
         M_full = F.softmax(self.m_logits + self.dag_mask, dim=-1) 
         M_internal = M_full[:, :-1] 
         
-        expected_area = torch.sum(P_c @ self.area_lib)
-        expected_pin_caps = P_c @ self.pin_caps_lib 
-        flat_expected_pin_caps = expected_pin_caps.view(-1) 
+        # 2. 利用概率计算面积与节点负载的数学期望
+        expected_area = 0.0
         
+        # [Dr. Gemini 修正 2]: 使用列表与 cat，彻底根除 In-place 梯度炸弹
+        expected_pin_caps_list = []
+
+        # 对于 每一个压缩器 c:
+        #     期望面积 += Sum( P_c[c] * c的所有可能物理面积 )
+        #     期望引脚电容向量[c的引脚区间] = P_c[c] 与 [c的所有物理引脚电容] 的点积
+        for j, c_type in enumerate(self.c_types):
+            is_fa = (c_type == 'FA')
+            lib_areas = self.fa_areas if is_fa else self.ha_areas
+            lib_caps = self.fa_caps if is_fa else self.ha_caps
+            
+            p_j = P_c[j, :self.num_fa_impls] if is_fa else P_c[j, :self.num_ha_impls]
+            expected_area = expected_area + torch.sum(p_j * lib_areas.to(P_c.device))
+            
+            c_caps = p_j @ lib_caps.to(P_c.device)
+            expected_pin_caps_list.append(c_caps)
+            
+        flat_expected_pin_caps = torch.cat(expected_pin_caps_list)
         loads = M_internal @ flat_expected_pin_caps 
         
-        node_ats = list(pp_at)
-        node_slews = list(pp_slew)
+        # 将输入节点的时序堆叠为 Tensor 备用
+        pp_ats_stack = torch.stack(list(pp_at))
+        pp_slews_stack = torch.stack(list(pp_slew))
         
         s_ats, s_slews = [], []
         co_ats, co_slews = [], []
 
         for j in range(self.num_c):
-            pin_ats = []
-            pin_slews = []
-            
+            pin_ats, pin_slews = [], []
             for p_idx in range(self.num_pins_per_c):
-                active_in_probs = M_internal[:len(node_ats), j * self.num_pins_per_c + p_idx]
+                col_idx = j * self.num_pins_per_c + p_idx
                 
-                # [Dr. Gemini 核心修正 2]: 互连线延迟传播直接使用线性期望，绝不能用 LSE！
-                # AT(v) = sum(P * AT(u))
-                expected_pin_at = torch.sum(active_in_probs * torch.stack(node_ats))
-                expected_pin_slew = torch.sum(active_in_probs * torch.stack(node_slews))
+                # [Dr. Gemini 核心修正 1]: 真正的深度拓扑连通！
+                # 1. 提取来自 PP (部分积) 的信号期望
+                m_pp = M_internal[:self.num_pp, col_idx]
+                expected_pin_at = torch.sum(m_pp * pp_ats_stack)
+                expected_pin_slew = torch.sum(m_pp * pp_slews_stack)
+                
+                # 2. 提取来自前方压缩器 S 输出的信号 (j > 0 时才有前方节点)
+                if j > 0:
+                    m_s = M_internal[self.num_pp : self.num_pp + j, col_idx]
+                    expected_pin_at = expected_pin_at + torch.sum(m_s * torch.stack(s_ats))
+                    expected_pin_slew = expected_pin_slew + torch.sum(m_s * torch.stack(s_slews))
+                    
+                    # 3. 提取来自前方压缩器 CO 输出的信号
+                    m_co = M_internal[self.num_pp + self.num_c : self.num_pp + self.num_c + j, col_idx]
+                    expected_pin_at = expected_pin_at + torch.sum(m_co * torch.stack(co_ats))
+                    expected_pin_slew = expected_pin_slew + torch.sum(m_co * torch.stack(co_slews))
                 
                 pin_ats.append(expected_pin_at)
                 pin_slews.append(expected_pin_slew)
 
+            # --- 下方的物理插值代码保持不变 ---
             s_load = loads[self.num_pp + j]
             co_load = loads[self.num_pp + self.num_c + j]
             
             expected_s_at, expected_s_slew = 0.0, 0.0
             expected_co_at, expected_co_slew = 0.0, 0.0
             
-            for impl_idx in range(self.num_impls):
+            is_fa = (self.c_types[j] == 'FA')
+            num_impls = self.num_fa_impls if is_fa else self.num_ha_impls
+            cell_arcs = self.fa_arcs if is_fa else self.ha_arcs
+            
+            for impl_idx in range(num_impls):
                 prob_impl = P_c[j, impl_idx]
-                arcs = self.cell_arcs[impl_idx]
+                arcs = cell_arcs[impl_idx]
                 
-                # 计算 S 输出的最差时序 (使用 LSE 进行 Cell 内部引脚的 Max 竞争)
                 s_paths_at, s_paths_slew = [], []
                 for p_idx, p_name in enumerate(self.pin_names):
                     if p_name in arcs['S']:
@@ -129,13 +189,9 @@ class DOMAC_CompressorTree(nn.Module):
                         s_paths_at.append(pin_ats[p_idx] + delay)
                         s_paths_slew.append(slew)
                         
-                if s_paths_at:
-                    s_at_impl = smooth_max_lse(torch.stack(s_paths_at), gamma=0.01)
-                    s_slew_impl = smooth_max_lse(torch.stack(s_paths_slew), gamma=0.01)
-                else:
-                    s_at_impl, s_slew_impl = torch.tensor(10.0), torch.tensor(10.0) # 幽灵路径惩罚
+                s_at_impl = smooth_max_lse(torch.stack(s_paths_at), gamma=0.01) if s_paths_at else torch.tensor(10.0, device=P_c.device)
+                s_slew_impl = smooth_max_lse(torch.stack(s_paths_slew), gamma=0.01) if s_paths_at else torch.tensor(10.0, device=P_c.device)
                     
-                # 计算 CO 输出的最差时序
                 co_paths_at, co_paths_slew = [], []
                 for p_idx, p_name in enumerate(self.pin_names):
                     if p_name in arcs['CO']:
@@ -145,11 +201,8 @@ class DOMAC_CompressorTree(nn.Module):
                         co_paths_at.append(pin_ats[p_idx] + delay)
                         co_paths_slew.append(slew)
                         
-                if co_paths_at:
-                    co_at_impl = smooth_max_lse(torch.stack(co_paths_at), gamma=0.01)
-                    co_slew_impl = smooth_max_lse(torch.stack(co_paths_slew), gamma=0.01)
-                else:
-                    co_at_impl, co_slew_impl = torch.tensor(10.0), torch.tensor(10.0) # 幽灵路径惩罚
+                co_at_impl = smooth_max_lse(torch.stack(co_paths_at), gamma=0.01) if co_paths_at else torch.tensor(10.0, device=P_c.device)
+                co_slew_impl = smooth_max_lse(torch.stack(co_paths_slew), gamma=0.01) if co_paths_at else torch.tensor(10.0, device=P_c.device)
                     
                 expected_s_at = expected_s_at + prob_impl * s_at_impl
                 expected_s_slew = expected_s_slew + prob_impl * s_slew_impl
@@ -161,23 +214,14 @@ class DOMAC_CompressorTree(nn.Module):
             co_ats.append(expected_co_at)
             co_slews.append(expected_co_slew)
             
-            # 将新节点加入全局时序图 (先加S，后加CO，顺序与 node_cols 严格对应)
-            if len(s_ats) == self.num_c:
-                node_ats.extend(s_ats)
-                node_slews.extend(s_slews)
-                node_ats.extend(co_ats)
-                node_slews.extend(co_slews)
-
-        # [Dr. Gemini 核心修正 3]: 拒绝 Slack 概率稀释
+        # 循环彻底结束后，再将所有的节点时序拼成全局 Tensor
+        node_ats = list(pp_at) + s_ats + co_ats
         all_ats_tensor = torch.stack(node_ats)
+        
         slacks = self.req_time - all_ats_tensor
         negative_slacks = torch.clamp(slacks, max=0.0)
         
-        # 只有真实连接到 Sink 的节点，其负裕量才被计入 (乘以连接概率，如果概率为0则过滤掉该路径的违反)
-        sink_probs = M_full[:, -1]
-        active_neg_slacks = -negative_slacks * sink_probs
-        
-        WNS = smooth_max_lse(active_neg_slacks, gamma=0.01) 
-        TNS = torch.sum(active_neg_slacks)
+        WNS = smooth_max_lse(-negative_slacks, gamma=0.01) 
+        TNS = torch.sum(-negative_slacks)
         
         return WNS, TNS, expected_area, M_internal, P_c

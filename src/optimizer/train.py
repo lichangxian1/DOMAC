@@ -21,6 +21,7 @@ class DOMACTrainer:
         # alpha: 面积权重
         # lambda1: 双射映射(合法连接)约束权重
         # lambda2: 二值化(0/1)约束权重
+        # Total_Loss = t1*WNS + t2*TNS + alpha*Area + lambda1*L_BM + lambda2*L_D
         self.hyperparams = {
             't1': 1.0,
             't2': 0.01,
@@ -66,7 +67,7 @@ class DOMACTrainer:
             self.optimizer.step()
             
             # 6. 工程监控打印 (每 20 步打印一次核心指标)
-            if epoch % 5 == 0 or epoch == max_epochs - 1:
+            if epoch % 20 == 0 or epoch == max_epochs - 1:
                 print(f"Epoch {epoch:03d} | "
                       f"WNS: {loss_dict['wns'].item():.4f} | "
                       f"Area: {loss_dict['area'].item():.4f} | "

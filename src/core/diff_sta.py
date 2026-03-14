@@ -55,7 +55,9 @@ def diff_bilinear_interp(slew, load, index_1_slew, index_2_load, lut_values):
     # 防止优化过程中产生的异常负载或 Slew 导致查表越界。Clamp 边界处的梯度为0，符合物理极限。
     # x = torch.clamp(slew, min=index_1_slew[0], max=index_1_slew[-1])
     # y = torch.clamp(load, min=index_2_load[0], max=index_2_load[-1])
-    
+    x = slew
+    y = load
+
     # 2. 定位坐标区间 (searchsorted 本身不产生梯度，我们依靠权重的代数运算产生梯度)
     idx_x = torch.searchsorted(index_1_slew, x)
     idx_y = torch.searchsorted(index_2_load, y)
