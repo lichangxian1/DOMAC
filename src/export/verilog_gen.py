@@ -104,13 +104,12 @@ class VerilogGenerator:
 
     def generate_testbench(self, tb_file="tb_domac.v", netlist_file="domac_result.v"):
         """
-        基于第一性原理，动态生成算术权重守恒测试平台
+        [Dr. Gemini 可视化版] 动态生成带“算式直播”的权重守恒测试平台
         """
-        print(f"[VerilogGen] 正在锻造自校验 Testbench: {tb_file}")
+        print(f"[VerilogGen] 正在锻造带算式输出的自校验 Testbench: {tb_file}")
         with open(tb_file, 'w') as f:
             f.write("`timescale 1ns/1ps\n\n")
             
-            # 由于要模拟底层的 TSMC 标准单元，我们需要提供最简单的行为级模型供仿真使用
             f.write("// ================= TSMC Mock Behavioral Models =================\n")
             for fa_name in set(self.fa_cell_names):
                 f.write(f"module {fa_name} (input A, B, CI, output S, CO);\n")
@@ -123,62 +122,67 @@ class VerilogGenerator:
                 
             f.write("module tb_domac;\n")
             
-            # 声明所有寄存器和线网
             pp_regs = [f"pp_in_{i}" for i in range(self.num_pp)]
             f.write(f"    reg {', '.join(pp_regs)};\n")
             
             out_wires = [port[0] for port in self.tb_output_ports]
             f.write(f"    wire {', '.join(out_wires)};\n\n")
             
-            # 例化被测模块 (DUT)
             f.write(f"    {self.module_name} DUT (\n")
             all_ports = pp_regs + out_wires
             f.write(",\n".join([f"        .{p}({p})" for p in all_ports]))
             f.write("\n    );\n\n")
             
-            # 构建检验逻辑
-            f.write("    integer expected_weight, actual_weight;\n")
+            # 使用 64 位整数 (reg [63:0]) 防止大位宽乘法器权重溢出
+            f.write("    reg [63:0] expected_weight, actual_weight;\n")
             f.write("    integer i;\n")
             f.write("    integer error_count = 0;\n\n")
             
             f.write("    initial begin\n")
-            f.write("        $display(\"\\n[Testbench] 启动权重守恒定律校验...\");\n")
+            f.write("        $display(\"\\n============================================================\");\n")
+            f.write("        $display(\" [DOMAC 算术验证中心] 启动权重守恒算式核对\");\n")
+            f.write("        $display(\"============================================================\\n\");\n")
             
-            # 生成 1000 次随机测试
             f.write("        for (i = 0; i < 1000; i = i + 1) begin\n")
             
-            # 随机驱动输入
             for i, p_reg in enumerate(pp_regs):
                 f.write(f"            {p_reg} = $random % 2;\n")
                 
-            f.write("            #5; // 等待组合逻辑稳定\n\n")
+            f.write("            #5; // 模拟信号穿过组合逻辑的延迟\n\n")
             
-            # 计算预期权重
             f.write("            expected_weight = 0")
             for i, p_reg in enumerate(pp_regs):
-                f.write(f" + ({p_reg} * (1 << {self.pp_cols[i]}))")
+                f.write(f" + ({p_reg} * (64'h1 << {self.pp_cols[i]}))")
             f.write(";\n")
             
-            # 计算实际权重
             f.write("            actual_weight = 0")
             for out_name, weight in self.tb_output_ports:
-                f.write(f" + ({out_name} * (1 << {weight}))")
+                f.write(f" + ({out_name} * (64'h1 << {weight}))")
             f.write(";\n\n")
             
-            # 断言比对
+            # ======== [核心修改：终端直播打印] ========
+            f.write("            // 打印前 20 次和每 100 次的详细算式，防止终端刷屏卡死\n")
+            f.write("            if (i < 20 || i % 100 == 0) begin\n")
+            f.write("                if (expected_weight === actual_weight)\n")
+            f.write("                    $display(\"  [Test %04d] 算式成立: 📥 进件总值 %10d  ===  📤 产出总值 %10d   [✔ PASS]\", i, expected_weight, actual_weight);\n")
+            f.write("                else\n")
+            f.write("                    $display(\"  [Test %04d] 算式崩塌: 📥 进件总值 %10d  =!=  📤 产出总值 %10d   [❌ FAIL]\", i, expected_weight, actual_weight);\n")
+            f.write("            end\n")
+            
             f.write("            if (expected_weight !== actual_weight) begin\n")
-            f.write("                $display(\"[致命错误] 守恒定律被打破！第 %0d 次测试失败。Expected: %0d, Actual: %0d\", i, expected_weight, actual_weight);\n")
             f.write("                error_count = error_count + 1;\n")
             f.write("            end\n")
             f.write("        end\n\n")
             
+            f.write("        $display(\"\\n============================================================\");\n")
             f.write("        if (error_count == 0)\n")
-            f.write("            $display(\"\\n[Testbench] 校验完美通过！AI 生成的压缩树在逻辑上 100%% 绝对等效于人类设计。\\n\");\n")
+            f.write("            $display(\" 🎉 [Testbench] 1000 次算式核对完美通过！拓扑绝对守恒！\");\n")
             f.write("        else\n")
-            f.write("            $display(\"\\n[Testbench] 测试失败，共发现 %0d 个错误。\\n\", error_count);\n")
+            f.write("            $display(\" 💥 [Testbench] 验证失败，共发现 %0d 个权重流失错误！\", error_count);\n")
+            f.write("        $display(\"============================================================\\n\");\n")
             
             f.write("        $finish;\n")
             f.write("    end\n")
             f.write("endmodule\n")
             
-        print(f"[VerilogGen] Testbench 锻造完毕！")
+        print(f"[VerilogGen] Testbench 可视化升级完毕！")

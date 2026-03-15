@@ -3,14 +3,6 @@ import sys
 import torch
 import time
 
-# 强行把底层 C++ 算子库的并发线程数限制在 4 个
-# 绝对不让 CPU 占用率飙升，完美绕过服务器 Watchdog 的拦截
-os.environ["OMP_NUM_THREADS"] = "4"
-os.environ["MKL_NUM_THREADS"] = "4"
-os.environ["OPENBLAS_NUM_THREADS"] = "4"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "4"
-os.environ["NUMEXPR_NUM_THREADS"] = "4"
-
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from src.parser.lib_parser import NLDMParser
@@ -95,7 +87,7 @@ def main():
         fa_names = [f"Mock_FA_Impl_{i}" for i in range(len(fa_tensors))]
         ha_names = [f"Mock_HA_Impl_{i}" for i in range(len(ha_tensors))]
 
-    BIT_WIDTH = 16  
+    BIT_WIDTH = 16
     PP_COLS, COMP_COLS, C_TYPES = generate_multiplier_canvas(BIT_WIDTH)
     NUM_PP = len(PP_COLS)
     NUM_COMPRESSORS = len(COMP_COLS)
@@ -126,30 +118,30 @@ def main():
     
     # ================= [新增：Dr. Gemini 的矩阵透视镜] =================
     # 临时修改 PyTorch 的打印选项，防止矩阵被折叠省略，保留 4 位小数以便观察概率分布
-    # torch.set_printoptions(precision=4, sci_mode=False, linewidth=150, profile="full")
+    torch.set_printoptions(precision=4, sci_mode=False, linewidth=150, profile="full")
     
-    # print("\n" + "="*60)
-    # print(" 🔍 [矩阵透视] 连续概率态 vs 物理离散态")
-    # print("="*60)
+    print("\n" + "="*60)
+    print(" 🔍 [矩阵透视] 连续概率态 vs 物理离散态")
+    print("="*60)
     
-    # print(f"\n1. [连续概率态] 物理实现矩阵 P_c (Shape: {final_P.shape}):")
-    # print("   (行代表 6 台压缩器，列代表 8 种物理门选项的选中概率)")
-    # print(final_P)
+    print(f"\n1. [连续概率态] 物理实现矩阵 P_c (Shape: {final_P.shape}):")
+    print("   (行代表 6 台压缩器，列代表 8 种物理门选项的选中概率)")
+    print(final_P)
     
-    # print("\n2. [离散坍缩态] 最终选定的物理门索引 P_discrete:")
-    # print(f"   {discrete_P}")
+    print("\n2. [离散坍缩态] 最终选定的物理门索引 P_discrete:")
+    print(f"   {discrete_P}")
     
-    # print(f"\n3. [连续概率态] 互连拓扑矩阵 M_internal (Shape: {final_M.shape}):")
-    # print("   (行代表 28 个物理节点，列代表 18 个压缩器靶点引脚的连线概率)")
-    # print(final_M)
+    print(f"\n3. [连续概率态] 互连拓扑矩阵 M_internal (Shape: {final_M.shape}):")
+    print("   (行代表 28 个物理节点，列代表 18 个压缩器靶点引脚的连线概率)")
+    print(final_M)
     
-    # print(f"\n4. [离散坍缩态] 合法化后的纯 0/1 拓扑矩阵 discrete_M (Shape: {discrete_M.shape}):")
-    # print("   (这就是最终喂给 Verilog 的纯血 EDA 布线图)")
-    # print(discrete_M)
+    print(f"\n4. [离散坍缩态] 合法化后的纯 0/1 拓扑矩阵 discrete_M (Shape: {discrete_M.shape}):")
+    print("   (这就是最终喂给 Verilog 的纯血 EDA 布线图)")
+    print(discrete_M)
     
-    # print("="*60 + "\n")
-    # # 恢复 PyTorch 默认打印截断（可选）
-    # torch.set_printoptions(profile="default")
+    print("="*60 + "\n")
+    # 恢复 PyTorch 默认打印截断（可选）
+    torch.set_printoptions(profile="default")
     # ===================================================================
 
     # 2. 启动 Verilog 打印机
@@ -178,5 +170,5 @@ def main():
 
 if __name__ == "__main__":
     # 开启 PyTorch 的异常检测，用于排查任何可能的梯度断裂
-    torch.autograd.set_detect_anomaly(True)
+    # torch.autograd.set_detect_anomaly(True)
     main()

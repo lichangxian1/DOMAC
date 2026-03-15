@@ -16,24 +16,43 @@ class DOMACLossFunction(nn.Module):
         """
         return t1 * wns + t2 * tns + alpha * area
 
-    def calc_bijective_mapping_loss(self, M_internal, P_c):
-        """
-        2. Pin-Level 双射映射约束 (Bijective Mapping Loss L_BM)
-        """
-        # 实际流入每个特定引脚的概率总和，Shape: [num_c * 3]
+    # def calc_bijective_mapping_loss(self, M_internal, P_c):
+    #     """
+    #     2. Pin-Level 双射映射约束 (Bijective Mapping Loss L_BM)
+    #     """
+    #     # 实际流入每个特定引脚的概率总和，Shape: [num_c * 3]
+    #     actual_in_signals = torch.sum(M_internal, dim=0) 
+        
+    #     num_c = P_c.shape[0]
+    #     # P_c 的列 0 是 FA，列 1 是 HA
+    #     expected_pins = torch.zeros(M_internal.shape[1], device=M_internal.device)
+        
+    #     for j in range(num_c):
+    #         expected_pins[j * 3 + 0] = 1.0       # A 引脚: 不管是 FA 还是 HA 都要连
+    #         expected_pins[j * 3 + 1] = 1.0       # B 引脚: 不管是 FA 还是 HA 都要连
+    #         expected_pins[j * 3 + 2] = P_c[j, 0] # CI 引脚: 只有被判为 FA 的概率部分才允许连线
+            
+    #     return torch.sum((actual_in_signals - expected_pins) ** 2)
+
+    def calc_bijective_mapping_loss(self, M_internal, P_c, active_pin_mask, c_types):
         actual_in_signals = torch.sum(M_internal, dim=0) 
-        
         num_c = P_c.shape[0]
-        # P_c 的列 0 是 FA，列 1 是 HA
         expected_pins = torch.zeros(M_internal.shape[1], device=M_internal.device)
-        
+    
         for j in range(num_c):
-            expected_pins[j * 3 + 0] = 1.0       # A 引脚: 不管是 FA 还是 HA 都要连
-            expected_pins[j * 3 + 1] = 1.0       # B 引脚: 不管是 FA 还是 HA 都要连
-            expected_pins[j * 3 + 2] = P_c[j, 0] # CI 引脚: 只有被判为 FA 的概率部分才允许连线
+            # A, B 引脚始终需要 1.0 的期望信号
+            expected_pins[j * 3 + 0] = 1.0
+            expected_pins[j * 3 + 1] = 1.0
+        
+             # CI 引脚：只有该坑位是 FA 时，才强制要求 1.0 的信号输入
+            # 注意：因为你的画布已经提前指定了 c_types (FA或HA)，不需要依赖 P_c 来判断逻辑类型
+            if c_types[j] == 'FA':
+                expected_pins[j * 3 + 2] = 1.0
+            else:
+                expected_pins[j * 3 + 2] = 0.0 # HA 绝不要 CI 信号
             
         return torch.sum((actual_in_signals - expected_pins) ** 2)
-
+    
     def calc_discretization_loss(self, tensor):
         """
         3. 二值化驱动损失 (Discretization Loss L_D)
@@ -59,7 +78,8 @@ class DOMACLossFunction(nn.Module):
         l_sink = (excess_signals ** 2) * 100.0
         return l_sink, total_sink_signals
 
-    def forward(self, wns, tns, area, M, P_c, hyperparams):
+    # def forward(self, wns, tns, area, M, P_c, hyperparams):
+    def forward(self, wns, tns, area, M, P_c, hyperparams, active_pin_mask, c_types):    
         """
         联合损失计算引擎
         """
@@ -73,8 +93,9 @@ class DOMACLossFunction(nn.Module):
         l_perf = self.calc_performance_loss(wns, tns, area, t1, t2, alpha)
         
         # 2. 合法拓扑 Loss
-        l_bm = self.calc_bijective_mapping_loss(M, P_c)
-        
+        # l_bm = self.calc_bijective_mapping_loss(M, P_c)
+        l_bm = self.calc_bijective_mapping_loss(M, P_c, active_pin_mask, c_types)
+
         # 3. 离散化 Loss 
         l_d_M = self.calc_discretization_loss(M)
         l_d_P = self.calc_discretization_loss(P_c)
