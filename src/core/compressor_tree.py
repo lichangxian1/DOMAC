@@ -4,8 +4,10 @@ import torch.nn.functional as F
 from .diff_sta import smooth_max_lse, diff_bilinear_interp
 
 class DOMAC_CompressorTree(nn.Module):
-    def __init__(self, pp_cols, c_cols, fa_tensors, ha_tensors, c_types, req_time):
+    # 1. 在初始化参数中加入 device
+    def __init__(self, pp_cols, c_cols, fa_tensors, ha_tensors, c_types, req_time, device='cpu'):
         super(DOMAC_CompressorTree, self).__init__()
+        self.device = device  # <--- [核心新增] 记住目标设备
         self.pp_cols = pp_cols
         self.c_cols = c_cols
         self.num_pp = len(pp_cols)
@@ -25,10 +27,11 @@ class DOMAC_CompressorTree(nn.Module):
         self.pin_names = ['A', 'B', 'CI']
         self.num_pins_per_c = len(self.pin_names)
         
-        # 预编译为 3D 张量的物理库
+        # 预编译为 3D 张量的物理库 (现在会在解析时直接上 GPU)
         self.fa_areas, self.fa_caps, self.fa_arcs = self._parse_tensors(fa_tensors)
         self.ha_areas, self.ha_caps, self.ha_arcs = self._parse_tensors(ha_tensors)
         
+        # ... 后续的 p_logits, dag_mask 等代码保持不变 ...
         self.p_logits = nn.Parameter(torch.zeros(self.num_c, self.max_impls))
         p_mask = torch.zeros(self.num_c, self.max_impls)
         active_pin_mask = torch.zeros(self.num_c * self.num_pins_per_c)
@@ -73,7 +76,6 @@ class DOMAC_CompressorTree(nn.Module):
             stacked_arcs['S'][p] = {'delay_lut': [], 'slew_lut': []}
             stacked_arcs['CO'][p] = {'delay_lut': [], 'slew_lut': []}
         
-        # 寻找基准坐标轴
         ref_arc = None
         for ct in tensors:
             for out_p in ['S', 'CO']:
@@ -99,19 +101,19 @@ class DOMAC_CompressorTree(nn.Module):
                         stacked_arcs[out_p][in_p]['delay_lut'].append(arc['delay_lut'])
                         stacked_arcs[out_p][in_p]['slew_lut'].append(arc['slew_lut'])
                     else:
-                        # 用 10.0 填充无用的空白时序弧，保证矩阵维度规整
                         stacked_arcs[out_p][in_p]['delay_lut'].append(torch.full((7,7), 10.0))
                         stacked_arcs[out_p][in_p]['slew_lut'].append(torch.full((7,7), 10.0))
 
-        # 将所有 2D 矩阵沿着实现维度叠成 3D 张量！
+        # =========================================================================
+        # [核弹级显存挂载] 强行把嵌套在字典里的 3D 物理矩阵全部搬运到 GPU 显存上！
         for out_p in ['S', 'CO']:
             for in_p in self.pin_names:
-                stacked_arcs[out_p][in_p]['delay_lut'] = torch.stack(stacked_arcs[out_p][in_p]['delay_lut'])
-                stacked_arcs[out_p][in_p]['slew_lut'] = torch.stack(stacked_arcs[out_p][in_p]['slew_lut'])
-                stacked_arcs[out_p][in_p]['index_1_slew'] = index_1_slew
-                stacked_arcs[out_p][in_p]['index_2_load'] = index_2_load
+                stacked_arcs[out_p][in_p]['delay_lut'] = torch.stack(stacked_arcs[out_p][in_p]['delay_lut']).to(self.device)
+                stacked_arcs[out_p][in_p]['slew_lut'] = torch.stack(stacked_arcs[out_p][in_p]['slew_lut']).to(self.device)
+                stacked_arcs[out_p][in_p]['index_1_slew'] = index_1_slew.to(self.device)
+                stacked_arcs[out_p][in_p]['index_2_load'] = index_2_load.to(self.device)
 
-        return torch.tensor(areas, dtype=torch.float32), torch.tensor(caps, dtype=torch.float32), stacked_arcs
+        return torch.tensor(areas, dtype=torch.float32, device=self.device), torch.tensor(caps, dtype=torch.float32, device=self.device), stacked_arcs
 
     def forward(self, pp_at, pp_slew):
         P_c = F.softmax(self.p_logits + self.p_mask, dim=-1) 

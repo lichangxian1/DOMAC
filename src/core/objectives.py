@@ -103,7 +103,7 @@ class DOMACLossFunction(nn.Module):
         
         # 4. Sink 惩罚 Loss
         # 我们希望最终整个乘法器这列最多只留 2 个信号给底部的加法器
-        l_sink, actual_sink_count = self.calc_sink_loss(M, target_max_signals=2.0)
+        l_sink, actual_sink_count = self.calc_sink_loss(M, target_max_signals=62.0)
         
         # 5. 总 Loss 融合
         l_bm_norm = l_bm / (l_bm.detach() + 1e-5)

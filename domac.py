@@ -92,13 +92,38 @@ def main():
     NUM_PP = len(PP_COLS)
     NUM_COMPRESSORS = len(COMP_COLS)
 
-    pp_at = torch.linspace(0.0, 0.1, NUM_PP) 
-    pp_slew = torch.full((NUM_PP,), 0.05)
+    # pp_at = torch.linspace(0.0, 0.1, NUM_PP) 
+    # pp_slew = torch.full((NUM_PP,), 0.05)
+    # REQ_TIME = 0.1 
+    # print("REQ_TIME：" + str(REQ_TIME))
+
+    # print(f"\n[Engine] 构建异构可微压缩树...")
+    # model = DOMAC_CompressorTree(PP_COLS, COMP_COLS, fa_tensors, ha_tensors, C_TYPES, REQ_TIME)
+
+    # loss_engine = DOMACLossFunction()
+    # trainer = DOMACTrainer(model, loss_engine, lr=0.05)
+    
+    # print("\n[Engine] 物理映射与梯度反向传播开始...")
+    
+    # start_time = time.time()
+    # final_M, final_P = trainer.train(pp_at, pp_slew, max_epochs=300)
+    # ================= [GPU 核动力点火] =================
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"\n[System] 核心计算引擎将挂载至: {device}")
+    if torch.cuda.is_available():
+        print(f" -> 检测到显卡: {torch.cuda.get_device_name(0)}")
+        # 为了极速性能，开启 CuDNN 基准测试加速
+        torch.backends.cudnn.benchmark = True 
+
+    # 1. 初始信号输入必须在显存上创建
+    pp_at = torch.linspace(0.0, 0.1, NUM_PP, device=device) 
+    pp_slew = torch.full((NUM_PP,), 0.05, device=device)
     REQ_TIME = 0.1 
     print("REQ_TIME：" + str(REQ_TIME))
 
     print(f"\n[Engine] 构建异构可微压缩树...")
-    model = DOMAC_CompressorTree(PP_COLS, COMP_COLS, fa_tensors, ha_tensors, C_TYPES, REQ_TIME)
+    # 2. 传递 device 给模型，并强制模型所有 Parameter 和 Buffer 上 GPU
+    model = DOMAC_CompressorTree(PP_COLS, COMP_COLS, fa_tensors, ha_tensors, C_TYPES, REQ_TIME, device=device).to(device)
 
     loss_engine = DOMACLossFunction()
     trainer = DOMACTrainer(model, loss_engine, lr=0.05)
