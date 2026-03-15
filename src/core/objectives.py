@@ -106,7 +106,10 @@ class DOMACLossFunction(nn.Module):
         l_sink, actual_sink_count = self.calc_sink_loss(M, target_max_signals=2.0)
         
         # 5. 总 Loss 融合
-        total_loss = l_perf + lambda1 * l_bm + lambda2 * l_d + l_sink
+        l_bm_norm = l_bm / (l_bm.detach() + 1e-5)
+        l_d_norm = l_d / (l_d.detach() + 1e-5)
+        l_sink_norm = l_sink / (l_sink.detach() + 1e-5)
+        total_loss = l_perf + lambda1 * l_bm_norm + lambda2 * l_d_norm + l_sink_norm
         
         loss_dict = {
             'total_loss': total_loss,

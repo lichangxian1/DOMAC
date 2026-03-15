@@ -2,7 +2,7 @@
 
 **Root Directory:** `/home/changxian/DOMAC_TSMC28`
 
-### `main.py`
+### `domac.py`
 
 ```python
 import os
@@ -123,8 +123,8 @@ def main():
     legalizer = DOMACLegalizer()
     discrete_M, discrete_P = legalizer.legalize(final_M, final_P, C_TYPES, model.dag_mask)
     
-    # ================= [新增：Dr. Gemini 的矩阵透视镜] =================
-    # 临时修改 PyTorch 的打印选项，防止矩阵被折叠省略，保留 4 位小数以便观察概率分布
+    # # ================= [新增：Dr. Gemini 的矩阵透视镜] =================
+    # # 临时修改 PyTorch 的打印选项，防止矩阵被折叠省略，保留 4 位小数以便观察概率分布
     # torch.set_printoptions(precision=4, sci_mode=False, linewidth=150, profile="full")
     
     # print("\n" + "="*60)
@@ -149,7 +149,7 @@ def main():
     # print("="*60 + "\n")
     # # 恢复 PyTorch 默认打印截断（可选）
     # torch.set_printoptions(profile="default")
-    # ===================================================================
+    # # ===================================================================
 
     # 2. 启动 Verilog 打印机
     # 确保输出目录存在
@@ -390,129 +390,111 @@ if __name__ == "__main__":
 import torch
 import torch.optim as optim
 import time
-# 假设我们在上层目录，实际工程中请根据你的模块路径调整 import
-# from src.core.compressor_tree import DOMAC_CompressorTree
-# from src.core.objectives import DOMACLossFunction
+import torch.profiler
 
 class DOMACTrainer:
     def __init__(self, model, loss_engine, lr=0.01):
         """
-        DOMAC 训练引擎
-        基于第一性原理驱动可微 STA 和约束场的收敛
+        DOMAC 训练引擎 (Dr. Gemini 性能探针版)
         """
         self.model = model
         self.loss_engine = loss_engine
-        # DOMAC 论文通常使用 Adam 优化器处理这类具有复杂地形的非凸优化问题
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
         
-        # ================= 初始超参数字典 =================
-        # t1, t2: 性能时序权重
-        # alpha: 面积权重
-        # lambda1: 双射映射(合法连接)约束权重
-        # lambda2: 二值化(0/1)约束权重
-        # Total_Loss = t1*WNS + t2*TNS + alpha*Area + lambda1*L_BM + lambda2*L_D
+# [Dr. Gemini 的极权统治：初期只看速度和合法性]
         self.hyperparams = {
-            't1': 1.0,
-            't2': 0.01,
-            'alpha': 0.05,  # 这个值可能需要根据 28nm 面积的量级做归一化调整
-            'lambda1': 1.0,
-            'lambda2': 1.0
+            't1': 100.0,     # WNS 权重拉到极致，逼迫网络突破延迟极限
+            't2': 1.0,       # TNS 辅助全局路径寻优
+            'alpha': 0.0,    # 【封印】前期绝对不许管面积！
+            'lambda1': 1.0,  # 连线合法性是必须的
+            'lambda2': 0.0,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
         }
+
+    # def update_hyperparameters(self, epoch):
+    #     if epoch >= 100:
+    #         self.hyperparams['alpha'] *= 1.003
+    #         self.hyperparams['t1'] *= 1.005
+    #         self.hyperparams['t2'] *= 1.005
+    #         self.hyperparams['lambda1'] *= 1.01
+    #         self.hyperparams['lambda2'] *= 1.01
 
     def update_hyperparameters(self, epoch):
         """
-        动态超参数退火调度器 (Dynamic Hyperparameter Scheduler)
-        严格遵循 DOMAC 论文第 IV-C 节的设定：
-        从第 100 步开始，每步增加特定百分比，强迫网络物理离散化。
+        动态退火调度器：分阶段释放约束
         """
-        if epoch >= 100:
-            self.hyperparams['alpha'] *= 1.003    # 面积权重每次增加 0.3%
-            self.hyperparams['t1'] *= 1.005       # WNS 权重每次增加 0.5%
-            self.hyperparams['t2'] *= 1.005       # TNS 权重每次增加 0.5%
-            self.hyperparams['lambda1'] *= 1.01   # 双射约束每次增加 1%
-            self.hyperparams['lambda2'] *= 1.01   # 二值化约束每次增加 1%
+        # 阶段 1 (Epoch 0-99)：野蛮生长，全力追求 WNS 和合法拓扑
+        
+        # 阶段 2 (Epoch 100 触发)：拓扑基本成型，开始施加面积与二值化压力
+        if epoch == 100:
+            print("\n[Scheduler] Epoch 100 抵达！解封 Area 与 二值化 (L_D) 约束！")
+            self.hyperparams['alpha'] = 0.05   
+            self.hyperparams['lambda2'] = 0.1  
+            
+        # 阶段 3 (Epoch 100-300)：温水煮青蛙，逐步收紧离散化和合法性，逼迫最终坍缩
+        if epoch > 100:
+            self.hyperparams['lambda1'] *= 1.02  # 越来越严苛的合法性
+            self.hyperparams['lambda2'] *= 1.05  # 逼迫概率走向 0 或 1
+            self.hyperparams['alpha'] *= 1.005   # 轻微压缩面积
 
     def train(self, pp_at, pp_slew, max_epochs=300):
-        """
-        执行主训练循环
-        """
         print(f"[Optimizer] 启动 DOMAC 训练循环，最大迭代次数: {max_epochs}")
+        print(f"[Profiler] 性能探针已植入。正在监控 Forward, Loss, Backward, Step 耗时...")
+        
+        # 性能累加器
+        acc_forward, acc_loss, acc_backward, acc_step = 0.0, 0.0, 0.0, 0.0
         
         for epoch in range(max_epochs):
-            # 1. 触发动态参数更新
             self.update_hyperparameters(epoch)
-            
-            # 2. 梯度清零
             self.optimizer.zero_grad()
             
-            # 3. 前向传播：穿过物理可微 STA 引擎
+            # ================= [探针 1: 前向传播 STA] =================
+            t0 = time.time()
             wns, tns, area, M, P_c = self.model(pp_at, pp_slew)
+            t1 = time.time()
+            acc_forward += (t1 - t0)
             
-            # # 4. 计算多目标联合 Loss
-            # total_loss, loss_dict = self.loss_engine(wns, tns, area, M, P_c, self.hyperparams)
-            
-            # 提取模型底层的物理拓扑掩码和压缩器逻辑阵列
             active_pin_mask = self.model.active_pin_mask
             c_types = self.model.c_types
             
-            # 4. 计算多目标联合 Loss (将物理屏障一并传入)
+            # ================= [探针 2: 目标与约束 Loss 计算] =================
             total_loss, loss_dict = self.loss_engine(
                 wns, tns, area, M, P_c, self.hyperparams, 
                 active_pin_mask, c_types
             )
+            t2 = time.time()
+            acc_loss += (t2 - t1)
 
-            # 5. 反向传播与参数更新
+            # ================= [探针 3: 反向传播梯度计算] =================
             total_loss.backward()
-            self.optimizer.step()
+            t3 = time.time()
+            acc_backward += (t3 - t2)
             
-            # 6. 工程监控打印 (每 20 步打印一次核心指标)
-            if epoch % 20 == 0 or epoch == max_epochs - 1:
-                print(f"Epoch {epoch:03d} | "
+            # ================= [探针 4: 优化器参数更新] =================
+            self.optimizer.step()
+            t4 = time.time()
+            acc_step += (t4 - t3)
+            
+            # 每 20 步打印一次物理指标与性能报告
+            if epoch % 5 == 0 or epoch == max_epochs - 1:
+                print(f"\nEpoch {epoch:03d} | "
                       f"WNS: {loss_dict['wns'].item():.4f} | "
                       f"Area: {loss_dict['area'].item():.4f} | "
-                      f"L_BM (连接合法性): {loss_dict['l_bm'].item():.4f} | "
-                      f"L_D (二值化): {loss_dict['l_d'].item():.4f} | "
-                      f"Actual_Sink: {loss_dict['actual_sink_count'].item():.2f} | "  # <--- 加上这个探针
+                      f"L_BM: {loss_dict['l_bm'].item():.4f} | "
                       f"Total Loss: {total_loss.item():.4f}")
-            time.sleep(0.1)
-        print("[Optimizer] 训练收敛完成。连续概率空间已逼近物理离散态。")
+                
+                # 打印过去 20 步的平均耗时 (如果是 Epoch 0，就是单步耗时)
+                div = 1 if epoch == 0 else 20
+                print(f"  -> [Profiler] Avg Time/Epoch - "
+                      f"Forward: {acc_forward/div:.3f}s | "
+                      f"Loss: {acc_loss/div:.3f}s | "
+                      f"Backward: {acc_backward/div:.3f}s | "
+                      f"Step: {acc_step/div:.3f}s")
+                
+                # 清零累加器，准备下一个周期的监控
+                acc_forward, acc_loss, acc_backward, acc_step = 0.0, 0.0, 0.0, 0.0
+
+        print("[Optimizer] 训练收敛完成。")
         return M.detach(), P_c.detach()
-
-# ================= 训练引擎独立自测 =================
-if __name__ == "__main__":
-    # 此处为脱离主框架的 Dummy 测试
-    import torch.nn as nn
-    import torch.nn.functional as F
-    
-    # 构建极简 Dummy 模型欺骗引擎，验证训练循环是否能跑通
-    class DummyModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.m_logits = nn.Parameter(torch.randn(5, 3))
-            self.p_logits = nn.Parameter(torch.randn(3, 2))
-        def forward(self, at, slew):
-            M = F.softmax(self.m_logits, dim=-1)
-            P_c = F.softmax(self.p_logits, dim=-1)
-            # 伪造 WNS, TNS, Area
-            return torch.tensor(1.5, requires_grad=True), torch.tensor(2.0, requires_grad=True), torch.tensor(10.0, requires_grad=True), M, P_c
-
-    class DummyLoss(nn.Module):
-        def forward(self, wns, tns, area, M, P_c, hp):
-            loss = hp['t1']*wns + hp['lambda1']*torch.sum(M) + hp['lambda2']*torch.sum(P_c)
-            return loss, {'wns': wns, 'area': area, 'l_bm': torch.sum(M), 'l_d': torch.sum(P_c)}
-
-    model = DummyModel()
-    loss_fn = DummyLoss()
-    trainer = DOMACTrainer(model, loss_fn, lr=0.05)
-    
-    dummy_at = torch.zeros(5)
-    dummy_slew = torch.zeros(5)
-    
-    # 试跑 300 步
-    final_M, final_P = trainer.train(dummy_at, dummy_slew, max_epochs=300)
-    
-    print("\n训练结束，查看最终的连接概率矩阵 M (局部):")
-    print(final_M[:2, :])
 ```
 
 ### `src/optimizer/legalizer.py`
@@ -612,67 +594,52 @@ from .diff_sta import smooth_max_lse, diff_bilinear_interp
 
 class DOMAC_CompressorTree(nn.Module):
     def __init__(self, pp_cols, c_cols, fa_tensors, ha_tensors, c_types, req_time):
-        """
-        DOMAC 压缩树核心引擎 (Dr. Gemini 终极重构版)
-        :param fa_tensors: 全加器 (FA) 的所有可用物理实现列表
-        :param ha_tensors: 半加器 (HA) 的所有可用物理实现列表
-        :param c_types: 预先分配的压缩器类型列表，例如 ['FA', 'FA', 'HA']
-        """
         super(DOMAC_CompressorTree, self).__init__()
-        
         self.pp_cols = pp_cols
         self.c_cols = c_cols
         self.num_pp = len(pp_cols)
         self.num_c = len(c_cols)
         self.c_types = c_types
         
-        # 物理节点扩容 (S 和 CO 独立输出)
         self.s_cols = c_cols
         self.co_cols = [col + 1 for col in c_cols] 
         self.node_cols = list(self.pp_cols) + list(self.s_cols) + list(self.co_cols)
         total_nodes = len(self.node_cols)
         
-        # 异构物理库对齐
-        self.num_fa_impls = len(fa_tensors) # FA的种类数
-        self.num_ha_impls = len(ha_tensors) # HA的种类数
-        self.max_impls = max(self.num_fa_impls, self.num_ha_impls) # 最大实现数，用于统一 Logits 维度
+        self.num_fa_impls = len(fa_tensors)
+        self.num_ha_impls = len(ha_tensors)
+        self.max_impls = max(self.num_fa_impls, self.num_ha_impls)
         self.req_time = req_time
         
         self.pin_names = ['A', 'B', 'CI']
         self.num_pins_per_c = len(self.pin_names)
         
-        # 预解析 FA 和 HA 物理库
+        # 预编译为 3D 张量的物理库
         self.fa_areas, self.fa_caps, self.fa_arcs = self._parse_tensors(fa_tensors)
         self.ha_areas, self.ha_caps, self.ha_arcs = self._parse_tensors(ha_tensors)
         
-        # 统一维度的选择概率 Logits
         self.p_logits = nn.Parameter(torch.zeros(self.num_c, self.max_impls))
-        
-        # 构建物理实现掩码与引脚映射掩码
         p_mask = torch.zeros(self.num_c, self.max_impls)
         active_pin_mask = torch.zeros(self.num_c * self.num_pins_per_c)
         
         for j, c_type in enumerate(self.c_types):
             if c_type == 'FA':
                 p_mask[j, self.num_fa_impls:] = float('-inf')
-                active_pin_mask[j*3 : j*3+3] = 1.0 # FA 需要 3 个输入
-            else: # HA
+                active_pin_mask[j*3 : j*3+3] = 1.0
+            else:
                 p_mask[j, self.num_ha_impls:] = float('-inf')
-                active_pin_mask[j*3 : j*3+2] = 1.0 # HA 只要 2 个输入
-                active_pin_mask[j*3+2] = 0.0       # 封死 CI 引脚
+                active_pin_mask[j*3 : j*3+2] = 1.0
+                active_pin_mask[j*3+2] = 0.0
                 
-        # 注册为 buffer，确保在 device 迁移时自动同步，但不参与梯度更新
         self.register_buffer('p_mask', p_mask)
         self.register_buffer('active_pin_mask', active_pin_mask)
         
         total_target_pins = self.num_c * self.num_pins_per_c 
         self.m_logits = nn.Parameter(torch.zeros(total_nodes, total_target_pins + 1))
         
-        # 构建严格的 DAG 拓扑掩码
         dag_mask = torch.full((total_nodes, total_target_pins + 1), float('-inf'))
         for i in range(total_nodes):
             for j in range(self.num_c):
-                # 防止组合逻辑环
                 if i < self.num_pp:
                     is_downstream = True
                 elif i < self.num_pp + self.num_c:
@@ -680,52 +647,69 @@ class DOMAC_CompressorTree(nn.Module):
                 else:
                     is_downstream = (i - self.num_pp - self.num_c) < j
 
-                is_same_column = (self.node_cols[i] == self.c_cols[j])
-                
-                if is_downstream and is_same_column:
+                if is_downstream and (self.node_cols[i] == self.c_cols[j]):
                     for p_idx in range(self.num_pins_per_c):
-                        # 只有存在这个引脚 (active_pin_mask == 1) 才允许连线
                         if self.active_pin_mask[j * 3 + p_idx] > 0.5:
                             dag_mask[i, j * self.num_pins_per_c + p_idx] = 0.0
-                        
-            # 外部输出通道 (Sink) 永远畅通
             dag_mask[i, total_target_pins] = 0.0 
             
         self.register_buffer('dag_mask', dag_mask)
 
-# 物理库解析器：将原始物理库 Tensor 转换为训练友好的格式
     def _parse_tensors(self, tensors):
-        areas, caps, arcs = [], [], []
+        areas, caps = [], []
+        stacked_arcs = {'S': {}, 'CO': {}}
+        for p in self.pin_names:
+            stacked_arcs['S'][p] = {'delay_lut': [], 'slew_lut': []}
+            stacked_arcs['CO'][p] = {'delay_lut': [], 'slew_lut': []}
+        
+        # 寻找基准坐标轴
+        ref_arc = None
+        for ct in tensors:
+            for out_p in ['S', 'CO']:
+                for in_p in self.pin_names:
+                    if ct.get(out_p, {}).get(in_p):
+                        ref_arc = ct[out_p][in_p]
+                        break
+                if ref_arc: break
+            if ref_arc: break
+            
+        index_1_slew = ref_arc['index_1_slew']
+        index_2_load = ref_arc['index_2_load']
+
         for ct in tensors:
             areas.append(ct.get('cell_area', 1.0))
             p_caps = [ct.get('pin_cap', {}).get(p, 0.001) for p in self.pin_names]
             caps.append(p_caps)
-            
-            arc_dict = {'S': {}, 'CO': {}}
-            for in_p in self.pin_names:
-                arc_s = ct.get('S', {}).get(in_p)
-                arc_co = ct.get('CO', {}).get(in_p)
-                if arc_s: arc_dict['S'][in_p] = arc_s
-                if arc_co: arc_dict['CO'][in_p] = arc_co
-            arcs.append(arc_dict)
-        return torch.tensor(areas, dtype=torch.float32), torch.tensor(caps, dtype=torch.float32), arcs
 
-# 前向传播：核心的可微 STA 计算逻辑
+            for out_p in ['S', 'CO']:
+                for in_p in self.pin_names:
+                    arc = ct.get(out_p, {}).get(in_p)
+                    if arc:
+                        stacked_arcs[out_p][in_p]['delay_lut'].append(arc['delay_lut'])
+                        stacked_arcs[out_p][in_p]['slew_lut'].append(arc['slew_lut'])
+                    else:
+                        # 用 10.0 填充无用的空白时序弧，保证矩阵维度规整
+                        stacked_arcs[out_p][in_p]['delay_lut'].append(torch.full((7,7), 10.0))
+                        stacked_arcs[out_p][in_p]['slew_lut'].append(torch.full((7,7), 10.0))
+
+        # 将所有 2D 矩阵沿着实现维度叠成 3D 张量！
+        for out_p in ['S', 'CO']:
+            for in_p in self.pin_names:
+                stacked_arcs[out_p][in_p]['delay_lut'] = torch.stack(stacked_arcs[out_p][in_p]['delay_lut'])
+                stacked_arcs[out_p][in_p]['slew_lut'] = torch.stack(stacked_arcs[out_p][in_p]['slew_lut'])
+                stacked_arcs[out_p][in_p]['index_1_slew'] = index_1_slew
+                stacked_arcs[out_p][in_p]['index_2_load'] = index_2_load
+
+        return torch.tensor(areas, dtype=torch.float32), torch.tensor(caps, dtype=torch.float32), stacked_arcs
+
     def forward(self, pp_at, pp_slew):
-        # 1. 施加异构物理掩码
         P_c = F.softmax(self.p_logits + self.p_mask, dim=-1) 
         M_full = F.softmax(self.m_logits + self.dag_mask, dim=-1) 
         M_internal = M_full[:, :-1] 
         
-        # 2. 利用概率计算面积与节点负载的数学期望
         expected_area = 0.0
-        
-        # [Dr. Gemini 修正 2]: 使用列表与 cat，彻底根除 In-place 梯度炸弹
         expected_pin_caps_list = []
 
-        # 对于 每一个压缩器 c:
-        #     期望面积 += Sum( P_c[c] * c的所有可能物理面积 )
-        #     期望引脚电容向量[c的引脚区间] = P_c[c] 与 [c的所有物理引脚电容] 的点积
         for j, c_type in enumerate(self.c_types):
             is_fa = (c_type == 'FA')
             lib_areas = self.fa_areas if is_fa else self.ha_areas
@@ -740,88 +724,75 @@ class DOMAC_CompressorTree(nn.Module):
         flat_expected_pin_caps = torch.cat(expected_pin_caps_list)
         loads = M_internal @ flat_expected_pin_caps 
         
-        # 将输入节点的时序堆叠为 Tensor 备用
-        pp_ats_stack = torch.stack(list(pp_at))
-        pp_slews_stack = torch.stack(list(pp_slew))
+        pp_ats_t = torch.stack(list(pp_at))
+        pp_slews_t = torch.stack(list(pp_slew))
         
         s_ats, s_slews = [], []
         co_ats, co_slews = [], []
 
         for j in range(self.num_c):
-            pin_ats, pin_slews = [], []
-            for p_idx in range(self.num_pins_per_c):
-                col_idx = j * self.num_pins_per_c + p_idx
+            col_start = j * self.num_pins_per_c
+            col_end = col_start + self.num_pins_per_c
+            
+            m_pp = M_internal[:self.num_pp, col_start:col_end]
+            pin_ats = pp_ats_t @ m_pp
+            pin_slews = pp_slews_t @ m_pp
+            
+            if j > 0:
+                s_ats_t = torch.stack(s_ats)
+                s_slews_t = torch.stack(s_slews)
+                m_s = M_internal[self.num_pp : self.num_pp + j, col_start:col_end]
+                pin_ats = pin_ats + s_ats_t @ m_s
+                pin_slews = pin_slews + s_slews_t @ m_s
                 
-                # [Dr. Gemini 核心修正 1]: 真正的深度拓扑连通！
-                # 1. 提取来自 PP (部分积) 的信号期望
-                m_pp = M_internal[:self.num_pp, col_idx]
-                expected_pin_at = torch.sum(m_pp * pp_ats_stack)
-                expected_pin_slew = torch.sum(m_pp * pp_slews_stack)
-                
-                # 2. 提取来自前方压缩器 S 输出的信号 (j > 0 时才有前方节点)
-                if j > 0:
-                    m_s = M_internal[self.num_pp : self.num_pp + j, col_idx]
-                    expected_pin_at = expected_pin_at + torch.sum(m_s * torch.stack(s_ats))
-                    expected_pin_slew = expected_pin_slew + torch.sum(m_s * torch.stack(s_slews))
-                    
-                    # 3. 提取来自前方压缩器 CO 输出的信号
-                    m_co = M_internal[self.num_pp + self.num_c : self.num_pp + self.num_c + j, col_idx]
-                    expected_pin_at = expected_pin_at + torch.sum(m_co * torch.stack(co_ats))
-                    expected_pin_slew = expected_pin_slew + torch.sum(m_co * torch.stack(co_slews))
-                
-                pin_ats.append(expected_pin_at)
-                pin_slews.append(expected_pin_slew)
+                co_ats_t = torch.stack(co_ats)
+                co_slews_t = torch.stack(co_slews)
+                m_co = M_internal[self.num_pp + self.num_c : self.num_pp + self.num_c + j, col_start:col_end]
+                pin_ats = pin_ats + co_ats_t @ m_co
+                pin_slews = pin_slews + co_slews_t @ m_co
 
-            # --- 下方的物理插值代码保持不变 ---
             s_load = loads[self.num_pp + j]
             co_load = loads[self.num_pp + self.num_c + j]
             
-            expected_s_at, expected_s_slew = 0.0, 0.0
-            expected_co_at, expected_co_slew = 0.0, 0.0
-            
             is_fa = (self.c_types[j] == 'FA')
-            num_impls = self.num_fa_impls if is_fa else self.num_ha_impls
             cell_arcs = self.fa_arcs if is_fa else self.ha_arcs
+            P_j = P_c[j, :self.num_fa_impls] if is_fa else P_c[j, :self.num_ha_impls]
             
-            for impl_idx in range(num_impls):
-                prob_impl = P_c[j, impl_idx]
-                arcs = cell_arcs[impl_idx]
-                
-                s_paths_at, s_paths_slew = [], []
-                for p_idx, p_name in enumerate(self.pin_names):
-                    if p_name in arcs['S']:
-                        arc = arcs['S'][p_name]
-                        delay = diff_bilinear_interp(pin_slews[p_idx], s_load, arc['index_1_slew'], arc['index_2_load'], arc['delay_lut'])
-                        slew = diff_bilinear_interp(pin_slews[p_idx], s_load, arc['index_1_slew'], arc['index_2_load'], arc['slew_lut'])
-                        s_paths_at.append(pin_ats[p_idx] + delay)
-                        s_paths_slew.append(slew)
-                        
-                s_at_impl = smooth_max_lse(torch.stack(s_paths_at), gamma=0.01) if s_paths_at else torch.tensor(10.0, device=P_c.device)
-                s_slew_impl = smooth_max_lse(torch.stack(s_paths_slew), gamma=0.01) if s_paths_at else torch.tensor(10.0, device=P_c.device)
+            s_paths_at, s_paths_slew = [], []
+            co_paths_at, co_paths_slew = [], []
+            
+            for p_idx, p_name in enumerate(self.pin_names):
+                if self.active_pin_mask[j * 3 + p_idx] > 0.5:
                     
-                co_paths_at, co_paths_slew = [], []
-                for p_idx, p_name in enumerate(self.pin_names):
-                    if p_name in arcs['CO']:
-                        arc = arcs['CO'][p_name]
-                        delay = diff_bilinear_interp(pin_slews[p_idx], co_load, arc['index_1_slew'], arc['index_2_load'], arc['delay_lut'])
-                        slew = diff_bilinear_interp(pin_slews[p_idx], co_load, arc['index_1_slew'], arc['index_2_load'], arc['slew_lut'])
-                        co_paths_at.append(pin_ats[p_idx] + delay)
-                        co_paths_slew.append(slew)
-                        
-                co_at_impl = smooth_max_lse(torch.stack(co_paths_at), gamma=0.01) if co_paths_at else torch.tensor(10.0, device=P_c.device)
-                co_slew_impl = smooth_max_lse(torch.stack(co_paths_slew), gamma=0.01) if co_paths_at else torch.tensor(10.0, device=P_c.device)
+                    # =========================================================================
+                    # [核弹级向量化] S 弧延迟计算 (无需 for 循环，一次插出 4 种门的数值！)
+                    arc_S = cell_arcs['S'][p_name]
+                    delays_S = diff_bilinear_interp(pin_slews[p_idx], s_load, arc_S['index_1_slew'], arc_S['index_2_load'], arc_S['delay_lut'])
+                    slews_S = diff_bilinear_interp(pin_slews[p_idx], s_load, arc_S['index_1_slew'], arc_S['index_2_load'], arc_S['slew_lut'])
                     
-                expected_s_at = expected_s_at + prob_impl * s_at_impl
-                expected_s_slew = expected_s_slew + prob_impl * s_slew_impl
-                expected_co_at = expected_co_at + prob_impl * co_at_impl
-                expected_co_slew = expected_co_slew + prob_impl * co_slew_impl
-                
+                    # 直接点乘概率矩阵，收割！
+                    s_paths_at.append(pin_ats[p_idx] + torch.sum(P_j * delays_S))
+                    s_paths_slew.append(torch.sum(P_j * slews_S))
+                    
+                    # CO 弧同理
+                    arc_CO = cell_arcs['CO'][p_name]
+                    delays_CO = diff_bilinear_interp(pin_slews[p_idx], co_load, arc_CO['index_1_slew'], arc_CO['index_2_load'], arc_CO['delay_lut'])
+                    slews_CO = diff_bilinear_interp(pin_slews[p_idx], co_load, arc_CO['index_1_slew'], arc_CO['index_2_load'], arc_CO['slew_lut'])
+                    
+                    co_paths_at.append(pin_ats[p_idx] + torch.sum(P_j * delays_CO))
+                    co_paths_slew.append(torch.sum(P_j * slews_CO))
+                    # =========================================================================
+
+            expected_s_at = smooth_max_lse(s_paths_at, gamma=0.01) if s_paths_at else torch.tensor(10.0, device=P_c.device)
+            expected_s_slew = smooth_max_lse(s_paths_slew, gamma=0.01) if s_paths_at else torch.tensor(10.0, device=P_c.device)
+            expected_co_at = smooth_max_lse(co_paths_at, gamma=0.01) if co_paths_at else torch.tensor(10.0, device=P_c.device)
+            expected_co_slew = smooth_max_lse(co_paths_slew, gamma=0.01) if co_paths_at else torch.tensor(10.0, device=P_c.device)
+            
             s_ats.append(expected_s_at)
             s_slews.append(expected_s_slew)
             co_ats.append(expected_co_at)
             co_slews.append(expected_co_slew)
             
-        # 循环彻底结束后，再将所有的节点时序拼成全局 Tensor
         node_ats = list(pp_at) + s_ats + co_ats
         all_ats_tensor = torch.stack(node_ats)
         
@@ -942,10 +913,13 @@ class DOMACLossFunction(nn.Module):
         
         # 4. Sink 惩罚 Loss
         # 我们希望最终整个乘法器这列最多只留 2 个信号给底部的加法器
-        l_sink, actual_sink_count = self.calc_sink_loss(M, target_max_signals=2.0)
+        l_sink, actual_sink_count = self.calc_sink_loss(M, target_max_signals=62.0)
         
         # 5. 总 Loss 融合
-        total_loss = l_perf + lambda1 * l_bm + lambda2 * l_d + l_sink
+        l_bm_norm = l_bm / (l_bm.detach() + 1e-5)
+        l_d_norm = l_d / (l_d.detach() + 1e-5)
+        l_sink_norm = l_sink / (l_sink.detach() + 1e-5)
+        total_loss = l_perf + lambda1 * l_bm_norm + lambda2 * l_d_norm + l_sink_norm
         
         loss_dict = {
             'total_loss': total_loss,
@@ -968,150 +942,55 @@ class DOMACLossFunction(nn.Module):
 import torch
 
 def smooth_max_lse(arrival_times, gamma=0.01):
-    """
-    Log-Sum-Exp (LSE) 平滑最大值算子。
-    在可微静态时序分析 (STA) 中替代不可导的 max() 操作。
-    确保时序图上的所有路径 (不仅是 Critical Path) 都能获得反向传播的梯度。
-    
-    参数:
-    arrival_times (list of Tensor or Tensor): 汇聚到同一节点的所有输入到达时间 (Arrival Time)
-    gamma (float): 平滑因子，论文默认设为 0.01。值越小越接近真实 Max，但梯度越陡峭。
-    
-    返回:
-    Tensor: 平滑后的最大到达时间 (标量 Tensor)
-    """
-    # if not arrival_times:
-    #     # 如果没有输入，默认到达时间为 0
-    #     return torch.tensor(0.0, dtype=torch.float32, requires_grad=True)
-    
-    # 【修复】：安全地判断传入的是空列表还是空张量
     if isinstance(arrival_times, list) and len(arrival_times) == 0:
         return torch.tensor(0.0, dtype=torch.float32, requires_grad=True)
     elif torch.is_tensor(arrival_times) and arrival_times.numel() == 0:
         return torch.tensor(0.0, dtype=torch.float32, requires_grad=True)
         
     if isinstance(arrival_times, list):
-        # 将列表中的 0D/1D tensor 堆叠，以便进行向量化运算
         stacked_at = torch.stack(arrival_times)
     else:
         stacked_at = arrival_times
 
-    # 运用 LSE 公式: gamma * ln( sum( e^(x_i / gamma) ) )
-    # 调用 torch.logsumexp 以保证底层的数值稳定性，防止指数爆炸
     lse_at = gamma * torch.logsumexp(stacked_at / gamma, dim=0)
-    
     return lse_at
 
 
 def diff_bilinear_interp(slew, load, index_1_slew, index_2_load, lut_values):
     """
-    可微双线性插值引擎 (Differentiable Bilinear Interpolation)。
-    基于 .lib 提取的 NLDM 离散查表，计算连续的 Delay 或 Output Slew，并保留反向传播梯度。
-    
-    参数:
-    slew (Tensor): 当前节点的输入转换时间 (标量 Tensor)
-    load (Tensor): 当前节点的输出负载电容 (标量 Tensor)
-    index_1_slew (Tensor): .lib 中提取的 slew 坐标轴 (1D Tensor)
-    index_2_load (Tensor): .lib 中提取的 load 坐标轴 (1D Tensor)
-    lut_values (Tensor): .lib 中提取的 2D 数值矩阵 (Delay 或 Slew)
-    
-    返回:
-    Tensor: 连续且可导的延迟或转换时间 (标量 Tensor)
+    终极张量广播版：可微双线性插值
+    完美支持 lut_values 形状为 [num_impls, 7, 7] 的 3D 张量批处理查表！
     """
-    # 1. 物理边界硬性截断 (Clamp)
-    # 防止优化过程中产生的异常负载或 Slew 导致查表越界。Clamp 边界处的梯度为0，符合物理极限。
-    # x = torch.clamp(slew, min=index_1_slew[0], max=index_1_slew[-1])
-    # y = torch.clamp(load, min=index_2_load[0], max=index_2_load[-1])
-    x = slew
-    y = load
+    x_min, x_max = index_1_slew[0], index_1_slew[-1]
+    y_min, y_max = index_2_load[0], index_2_load[-1]
+    
+    x = torch.clamp(slew, min=x_min, max=x_max)
+    y = torch.clamp(load, min=y_min, max=y_max)
 
-    # 2. 定位坐标区间 (searchsorted 本身不产生梯度，我们依靠权重的代数运算产生梯度)
     idx_x = torch.searchsorted(index_1_slew, x)
     idx_y = torch.searchsorted(index_2_load, y)
     
-    # 确保索引不越界 (兜底保护)
     idx_x = torch.clamp(idx_x, 1, len(index_1_slew) - 1)
     idx_y = torch.clamp(idx_y, 1, len(index_2_load) - 1)
     
-    # 3. 提取四个网格顶点的物理坐标
     x0 = index_1_slew[idx_x - 1]
     x1 = index_1_slew[idx_x]
     y0 = index_2_load[idx_y - 1]
     y1 = index_2_load[idx_y]
     
-    # 4. 提取四个网格顶点的 LUT 数值
-    v00 = lut_values[idx_x - 1, idx_y - 1]
-    v01 = lut_values[idx_x - 1, idx_y]
-    v10 = lut_values[idx_x, idx_y - 1]
-    v11 = lut_values[idx_x, idx_y]
+    # 利用 ... (Ellipsis) 完美兼容 2D [7,7] 和 3D [N,7,7] 张量！
+    v00 = lut_values[..., idx_x - 1, idx_y - 1]
+    v01 = lut_values[..., idx_x - 1, idx_y]
+    v10 = lut_values[..., idx_x, idx_y - 1]
+    v11 = lut_values[..., idx_x, idx_y]
     
-    # 5. 计算可微权重 (wx, wy 保留了来自 x 和 y 的梯度)
     wx = (x - x0) / (x1 - x0)
     wy = (y - y0) / (y1 - y0)
     
-    # 6. 执行双线性插值 (代数组合，完美支持 Autograd)
     val0 = v00 * (1 - wy) + v01 * wy
     val1 = v10 * (1 - wy) + v11 * wy
-    interpolated_value = val0 * (1 - wx) + val1 * wx
     
-    return interpolated_value
-
-
-def compute_expected_timing(p_c, cell_tensors_dict, in_pin, out_pin, slew, load):
-    """
-    计算基于实现概率的期望时序 (Expected Timing)。
-    对应 DOMAC 论文中的期望延迟与期望 Slew 计算公式。
-    
-    参数:
-    p_c (Tensor): 当前压缩器的实现概率分布，例如 [p_FA, p_HA]，需满足 sum(p_c) == 1
-    cell_tensors_dict (list of dict): 包含不同 Cell (FA, HA) 的物理张量字典列表
-    in_pin (str): 输入引脚名 (如 'A', 'B', 'CI')
-    out_pin (str): 输出引脚名 (如 'S', 'CO')
-    slew (Tensor): 期望输入转换时间
-    load (Tensor): 期望输出负载
-    
-    返回:
-    tuple: (expected_delay, expected_out_slew) 均携带梯度
-    """
-    expected_delay = torch.tensor(0.0, dtype=torch.float32)
-    expected_out_slew = torch.tensor(0.0, dtype=torch.float32)
-    
-    # 遍历所有可能的实现 (FA, HA...)
-    for idx, cell_tensors in enumerate(cell_tensors_dict):
-        prob = p_c[idx]
-        
-        # 物理剪枝：如果当前概率极小，可跳过插值运算以加速前向传播 (可选优化)
-        # if prob < 1e-4: continue 
-        
-        # 提取特定引脚时序弧的张量
-        arc_data = cell_tensors.get(out_pin, {}).get(in_pin)
-        
-        if arc_data is None:
-            # 如果没有这条时序弧 (例如 HA 可能没有 CI 到 CO 的弧)
-            # continue
-            delay = torch.tensor(10.0, dtype=torch.float32, device=p_c.device)
-            out_slew = torch.tensor(10.0, dtype=torch.float32, device=p_c.device)
-            
-        # 可微查表
-        delay = diff_bilinear_interp(
-            slew, load, 
-            arc_data['index_1_slew'], arc_data['index_2_load'], arc_data['delay_lut']
-        )
-        out_slew = diff_bilinear_interp(
-            slew, load, 
-            arc_data['index_1_slew'], arc_data['index_2_load'], arc_data['slew_lut']
-        )
-        
-        # 概率加权累加 (累加操作完美可导)
-        expected_delay = expected_delay + prob * delay
-        expected_out_slew = expected_out_slew + prob * out_slew
-        
-    return expected_delay, expected_out_slew
-
-# ================= 底层算子自测单元 =================
-if __name__ == "__main__":
-    # 纯净的底层自测逻辑，确保矩阵与梯度的连通性
-    print("[DiffSTA] 底层算子加载完毕。当前工作模式：严格可微静态时序分析。")
+    return val0 * (1 - wx) + val1 * wx
 ```
 
 ### `src/export/verilog_gen.py`
