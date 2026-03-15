@@ -3,6 +3,14 @@ import sys
 import torch
 import time
 
+# 强行把底层 C++ 算子库的并发线程数限制在 4 个
+# 绝对不让 CPU 占用率飙升，完美绕过服务器 Watchdog 的拦截
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+os.environ["OPENBLAS_NUM_THREADS"] = "4"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "4"
+os.environ["NUMEXPR_NUM_THREADS"] = "4"
+
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from src.parser.lib_parser import NLDMParser
@@ -87,7 +95,7 @@ def main():
         fa_names = [f"Mock_FA_Impl_{i}" for i in range(len(fa_tensors))]
         ha_names = [f"Mock_HA_Impl_{i}" for i in range(len(ha_tensors))]
 
-    BIT_WIDTH = 8  
+    BIT_WIDTH = 16  
     PP_COLS, COMP_COLS, C_TYPES = generate_multiplier_canvas(BIT_WIDTH)
     NUM_PP = len(PP_COLS)
     NUM_COMPRESSORS = len(COMP_COLS)

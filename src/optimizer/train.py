@@ -1,6 +1,6 @@
 import torch
 import torch.optim as optim
-
+import time
 # 假设我们在上层目录，实际工程中请根据你的模块路径调整 import
 # from src.core.compressor_tree import DOMAC_CompressorTree
 # from src.core.objectives import DOMACLossFunction
@@ -74,7 +74,7 @@ class DOMACTrainer:
                       f"L_BM (连接合法性): {loss_dict['l_bm'].item():.4f} | "
                       f"L_D (二值化): {loss_dict['l_d'].item():.4f} | "
                       f"Total Loss: {total_loss.item():.4f}")
-
+            time.sleep(0.1)
         print("[Optimizer] 训练收敛完成。连续概率空间已逼近物理离散态。")
         return M.detach(), P_c.detach()
 
