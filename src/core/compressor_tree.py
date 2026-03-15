@@ -137,9 +137,14 @@ class DOMAC_CompressorTree(nn.Module):
         flat_expected_pin_caps = torch.cat(expected_pin_caps_list)
         loads = M_internal @ flat_expected_pin_caps 
         
-        pp_ats_t = torch.stack(list(pp_at))
-        pp_slews_t = torch.stack(list(pp_slew))
-        
+        # =========================================================================
+        # [Dr. Gemini 降维打击：Push 前向广播范式]
+        # 1. 初始时刻：只利用外部输入的 PP 信号，一波推给压缩树的所有引脚进行打底！
+        m_pp_all = M_internal[:self.num_pp, :]
+        pin_ats_all = pp_at @ m_pp_all
+        pin_slews_all = pp_slew @ m_pp_all
+        # =========================================================================
+
         s_ats, s_slews = [], []
         co_ats, co_slews = [], []
 
@@ -147,22 +152,10 @@ class DOMAC_CompressorTree(nn.Module):
             col_start = j * self.num_pins_per_c
             col_end = col_start + self.num_pins_per_c
             
-            m_pp = M_internal[:self.num_pp, col_start:col_end]
-            pin_ats = pp_ats_t @ m_pp
-            pin_slews = pp_slews_t @ m_pp
-            
-            if j > 0:
-                s_ats_t = torch.stack(s_ats)
-                s_slews_t = torch.stack(s_slews)
-                m_s = M_internal[self.num_pp : self.num_pp + j, col_start:col_end]
-                pin_ats = pin_ats + s_ats_t @ m_s
-                pin_slews = pin_slews + s_slews_t @ m_s
-                
-                co_ats_t = torch.stack(co_ats)
-                co_slews_t = torch.stack(co_slews)
-                m_co = M_internal[self.num_pp + self.num_c : self.num_pp + self.num_c + j, col_start:col_end]
-                pin_ats = pin_ats + co_ats_t @ m_co
-                pin_slews = pin_slews + co_slews_t @ m_co
+            # 2. 坐享其成：当前压缩器的输入引脚时序，早已被前面的兄弟计算好并推送过来了！
+            # 彻底消灭了 O(N^2) 的 torch.stack 和切片！
+            pin_ats = pin_ats_all[col_start:col_end]
+            pin_slews = pin_slews_all[col_start:col_end]
 
             s_load = loads[self.num_pp + j]
             co_load = loads[self.num_pp + self.num_c + j]
@@ -177,37 +170,44 @@ class DOMAC_CompressorTree(nn.Module):
             for p_idx, p_name in enumerate(self.pin_names):
                 if self.active_pin_mask[j * 3 + p_idx] > 0.5:
                     
-                    # =========================================================================
-                    # [核弹级向量化] S 弧延迟计算 (无需 for 循环，一次插出 4 种门的数值！)
                     arc_S = cell_arcs['S'][p_name]
                     delays_S = diff_bilinear_interp(pin_slews[p_idx], s_load, arc_S['index_1_slew'], arc_S['index_2_load'], arc_S['delay_lut'])
                     slews_S = diff_bilinear_interp(pin_slews[p_idx], s_load, arc_S['index_1_slew'], arc_S['index_2_load'], arc_S['slew_lut'])
                     
-                    # 直接点乘概率矩阵，收割！
                     s_paths_at.append(pin_ats[p_idx] + torch.sum(P_j * delays_S))
                     s_paths_slew.append(torch.sum(P_j * slews_S))
                     
-                    # CO 弧同理
                     arc_CO = cell_arcs['CO'][p_name]
                     delays_CO = diff_bilinear_interp(pin_slews[p_idx], co_load, arc_CO['index_1_slew'], arc_CO['index_2_load'], arc_CO['delay_lut'])
                     slews_CO = diff_bilinear_interp(pin_slews[p_idx], co_load, arc_CO['index_1_slew'], arc_CO['index_2_load'], arc_CO['slew_lut'])
                     
                     co_paths_at.append(pin_ats[p_idx] + torch.sum(P_j * delays_CO))
                     co_paths_slew.append(torch.sum(P_j * slews_CO))
-                    # =========================================================================
 
             expected_s_at = smooth_max_lse(s_paths_at, gamma=0.01) if s_paths_at else torch.tensor(10.0, device=P_c.device)
             expected_s_slew = smooth_max_lse(s_paths_slew, gamma=0.01) if s_paths_at else torch.tensor(10.0, device=P_c.device)
             expected_co_at = smooth_max_lse(co_paths_at, gamma=0.01) if co_paths_at else torch.tensor(10.0, device=P_c.device)
             expected_co_slew = smooth_max_lse(co_paths_slew, gamma=0.01) if co_paths_at else torch.tensor(10.0, device=P_c.device)
             
+            # =========================================================================
+            # 3. [核弹级推送] 本节点算完后，直接通过 M_internal 一波推给所有未来的潜在下游引脚！
+            # a = a + b 是安全的 out-of-place 加法，完美保留 Autograd 梯度！
+            pin_ats_all = pin_ats_all + expected_s_at * M_internal[self.num_pp + j, :]
+            pin_slews_all = pin_slews_all + expected_s_slew * M_internal[self.num_pp + j, :]
+            
+            pin_ats_all = pin_ats_all + expected_co_at * M_internal[self.num_pp + self.num_c + j, :]
+            pin_slews_all = pin_slews_all + expected_co_slew * M_internal[self.num_pp + self.num_c + j, :]
+            # =========================================================================
+            
             s_ats.append(expected_s_at)
             s_slews.append(expected_s_slew)
             co_ats.append(expected_co_at)
             co_slews.append(expected_co_slew)
             
-        node_ats = list(pp_at) + s_ats + co_ats
-        all_ats_tensor = torch.stack(node_ats)
+        # 完美拼接，彻底消灭 list of tensors 导致的 O(N) 性能雪崩
+        s_ats_t = torch.stack(s_ats)
+        co_ats_t = torch.stack(co_ats)
+        all_ats_tensor = torch.cat([pp_at, s_ats_t, co_ats_t])
         
         slacks = self.req_time - all_ats_tensor
         negative_slacks = torch.clamp(slacks, max=0.0)
