@@ -133,6 +133,30 @@ def main():
             print("[System] 发现 PDK 物理库，启动解析...")
             parser = NLDMParser(lib_path, TARGET_CELLS)
             nldm_db = parser.parse()
+            # ================= [新增：物理数据透明化打印] =================
+            print("\n" + "="*60)
+            print(" 📊 [物理数据核对] 提取的 Area 与 Delay (Worst-case) 概览")
+            print("="*60)
+            for cell in TARGET_CELLS:
+                if cell in nldm_db:
+                    area = nldm_db[cell].get('cell_area', 'N/A')
+                    print(f"[{cell}]")
+                    print(f"  -> 面积 (Area): {area} μm²")
+                    
+                    # 挑选一个最长路径的时序弧 (例如 A -> S) 打印其延迟信息
+                    if 'S' in nldm_db[cell] and 'A' in nldm_db[cell]['S']:
+                        delay_lut = nldm_db[cell]['S']['A']['delay_lut']
+                        # 兼容 PyTorch Tensor 和 NumPy Array 的打印
+                        if hasattr(delay_lut, 'min'):
+                            delay_min = delay_lut.min().item()
+                            delay_max = delay_lut.max().item()
+                            print(f"  -> A->S 延迟 LUT 尺寸: {delay_lut.shape}")
+                            print(f"  -> A->S 延迟极限范围: {delay_min:.5f} ns ~ {delay_max:.5f} ns")
+                    else:
+                        print("  -> [警告] 未提取到 A->S 的时序弧！")
+                    print("-" * 40)
+            print("="*60 + "\n")
+            # ===================================================================
             fa_tensors = [nldm_db[c] for c in TARGET_CELLS if c.startswith('FA') and c in nldm_db]
             ha_tensors = [nldm_db[c] for c in TARGET_CELLS if c.startswith('HA') and c in nldm_db]
         else:
@@ -253,7 +277,14 @@ def main():
     v_gen.generate_multiplier_top(
         bit_width=BIT_WIDTH, 
         top_file=top_path, 
-        ct_module_name="domac_compressor_tree"
+        ct_module_name="domac_compressor_tree", 
+        top_module_name="domac_multiplier_top"
+    )
+    # ================= [新增：顺手生成纯血对照组网表] =================
+    v_gen.generate_pure_dadda_baseline(
+        bit_width=BIT_WIDTH,
+        output_file="output/netlists/dadda_baseline_ct.v",
+        top_file="output/netlists/dadda_baseline_top.v"
     )
 
     end_time = time.time()

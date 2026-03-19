@@ -140,6 +140,30 @@ def main():
             print("[System] 发现 PDK 物理库，启动解析...")
             parser = NLDMParser(lib_path, TARGET_CELLS)
             nldm_db = parser.parse()
+            # ================= [新增：物理数据透明化打印] =================
+            print("\n" + "="*60)
+            print(" 📊 [物理数据核对] 提取的 Area 与 Delay (Worst-case) 概览")
+            print("="*60)
+            for cell in TARGET_CELLS:
+                if cell in nldm_db:
+                    area = nldm_db[cell].get('cell_area', 'N/A')
+                    print(f"[{cell}]")
+                    print(f"  -> 面积 (Area): {area} μm²")
+                    
+                    # 挑选一个最长路径的时序弧 (例如 A -> S) 打印其延迟信息
+                    if 'S' in nldm_db[cell] and 'A' in nldm_db[cell]['S']:
+                        delay_lut = nldm_db[cell]['S']['A']['delay_lut']
+                        # 兼容 PyTorch Tensor 和 NumPy Array 的打印
+                        if hasattr(delay_lut, 'min'):
+                            delay_min = delay_lut.min().item()
+                            delay_max = delay_lut.max().item()
+                            print(f"  -> A->S 延迟 LUT 尺寸: {delay_lut.shape}")
+                            print(f"  -> A->S 延迟极限范围: {delay_min:.5f} ns ~ {delay_max:.5f} ns")
+                    else:
+                        print("  -> [警告] 未提取到 A->S 的时序弧！")
+                    print("-" * 40)
+            print("="*60 + "\n")
+            # ===================================================================
             fa_tensors = [nldm_db[c] for c in TARGET_CELLS if c.startswith('FA') and c in nldm_db]
             ha_tensors = [nldm_db[c] for c in TARGET_CELLS if c.startswith('HA') and c in nldm_db]
         else:
@@ -260,7 +284,14 @@ def main():
     v_gen.generate_multiplier_top(
         bit_width=BIT_WIDTH, 
         top_file=top_path, 
-        ct_module_name="domac_compressor_tree"
+        ct_module_name="domac_compressor_tree", 
+        top_module_name="domac_multiplier_top"
+    )
+    # ================= [新增：顺手生成纯血对照组网表] =================
+    v_gen.generate_pure_dadda_baseline(
+        bit_width=BIT_WIDTH,
+        output_file="output/netlists/dadda_baseline_ct.v",
+        top_file="output/netlists/dadda_baseline_top.v"
     )
 
     end_time = time.time()
@@ -522,7 +553,7 @@ class DOMACTrainer:
         
 # [Dr. Gemini 的极权统治：初期只看速度和合法性]
         self.hyperparams = {
-            't1': 1.0,     # WNS 权重拉到极致，逼迫网络突破延迟极限
+            't1': 10000.0,     # WNS 权重拉到极致，逼迫网络突破延迟极限
             't2': 0.01,       # TNS 辅助全局路径寻优
             'alpha': 3.0,    # 【封印】前期绝对不许管面积！
             'lambda1': 0.1,  # 连线合法性是必须的
@@ -1350,7 +1381,7 @@ class VerilogGenerator:
             f.write("endmodule\n")        
         print(f"[VerilogGen] Testbench 可视化升级完毕！")
 
-    def generate_multiplier_top(self, bit_width, top_file="domac_multiplier_top.v", ct_module_name="domac_compressor_tree"):
+    def generate_multiplier_top(self, bit_width, top_file="domac_multiplier_top.v", ct_module_name="domac_compressor_tree", top_module_name="domac_multiplier_top"):
         """
         [Dr. Gemini 终极装配线] 自动生成完整的乘法器顶层封装模块
         包含: PPG (部分积生成阵列) + CT (DOMAC 压缩树) + CPA (末级加法器)
@@ -1361,7 +1392,7 @@ class VerilogGenerator:
         
         with open(top_file, 'w') as f:
             f.write(f"`timescale 1ns/1ps\n\n")
-            f.write(f"module domac_multiplier_top (\n")
+            f.write(f"module {top_module_name} (\n")
             f.write(f"    input  wire [{bit_width-1}:0] A,\n")
             f.write(f"    input  wire [{bit_width-1}:0] B,\n")
             f.write(f"    output wire [{out_width-1}:0] P\n")
@@ -1437,6 +1468,144 @@ class VerilogGenerator:
             f.write("endmodule\n")
             
         print(f"[VerilogGen] 顶层模块封装完毕！可直接送入综合工具。")
+
+    def generate_pure_dadda_baseline(self, bit_width, output_file="dadda_baseline_ct.v", top_file="dadda_baseline_top.v"):
+        """
+        [Dr. Gemini 基准线生成器] 直接输出纯正的 Dadda Tree 初始 Verilog 网表
+        用于控制变量法对照实验 (Control Experiment)
+        """
+        print(f"\n[BaselineGen] 启动纯血 Dadda Tree 基准网表生成器...")
+        
+        # 默认使用索引 0 的物理单元作为基础构建块 (通常是驱动最小的 D0 或基础 D1)
+        fa_name = self.fa_cell_names[0]
+        ha_name = self.ha_cell_names[0]
+        
+        max_cols = bit_width * 2 - 1
+        signals = [[] for _ in range(max_cols)]
+        
+        # 1. 初始化部分积信号池
+        k = 0
+        for i in range(bit_width):
+            for j in range(bit_width):
+                signals[i+j].append(f"pp_in_{k}")
+                k += 1
+                
+        # 2. 推导目标高度序列
+        dadda_seq = [2]
+        while dadda_seq[-1] < bit_width:
+            dadda_seq.append(int(dadda_seq[-1] * 1.5))
+        dadda_seq.reverse()
+        targets = [t for t in dadda_seq if t < max([len(col) for col in signals])]
+        
+        verilog_lines = []
+        comp_idx = 0
+        
+        # 3. 严格遵循 Dadda 算法逐级收敛连线
+        for stage_idx, target in enumerate(targets):
+            next_signals = [[] for _ in range(max_cols + 1)]
+            carry_from_prev = []
+            
+            for col in range(len(signals)):
+                # Dadda 物理连线法则：当前列未压缩的点 + 上一列传来的进位，共同构成当前列的总点数
+                current_sigs = signals[col] + carry_from_prev
+                V = len(current_sigs)
+                
+                if V > target:
+                    reduction_needed = V - target
+                    f = reduction_needed // 2
+                    h = reduction_needed % 2
+                    
+                    carries_generated = []
+                    
+                    for _ in range(f):
+                        s1 = current_sigs.pop()
+                        s2 = current_sigs.pop()
+                        s3 = current_sigs.pop()
+                        s_out = f"comp_{comp_idx}_S"
+                        co_out = f"comp_{comp_idx}_CO"
+                        verilog_lines.append(f"    {fa_name} U_comp_{comp_idx} (.A({s1}), .B({s2}), .CI({s3}), .S({s_out}), .CO({co_out}));")
+                        comp_idx += 1
+                        next_signals[col].append(s_out)
+                        carries_generated.append(co_out)
+                        
+                    for _ in range(h):
+                        s1 = current_sigs.pop()
+                        s2 = current_sigs.pop()
+                        s_out = f"comp_{comp_idx}_S"
+                        co_out = f"comp_{comp_idx}_CO"
+                        verilog_lines.append(f"    {ha_name} U_comp_{comp_idx} (.A({s1}), .B({s2}), .S({s_out}), .CO({co_out}));")
+                        comp_idx += 1
+                        next_signals[col].append(s_out)
+                        carries_generated.append(co_out)
+                        
+                    next_signals[col].extend(current_sigs)
+                    carry_from_prev = carries_generated
+                else:
+                    next_signals[col].extend(current_sigs)
+                    carry_from_prev = []
+                    
+            if carry_from_prev:
+                if len(signals) >= len(next_signals):
+                    next_signals.append([])
+                next_signals[len(signals)].extend(carry_from_prev)
+                
+            signals = next_signals
+
+        while signals and not signals[-1]:
+            signals.pop()
+            
+        # 4. 收集最终输出端口与权重映射
+        outputs_with_weights = []
+        assign_lines = []
+        for col, sigs in enumerate(signals):
+            for sig in sigs:
+                if sig.startswith("pp_in_"):
+                    # 如果有初级信号一刀未剪直达底层，需赋予别名
+                    out_name = f"out_{sig}"
+                    assign_lines.append(f"    assign {out_name} = {sig};")
+                    outputs_with_weights.append((out_name, col))
+                else:
+                    outputs_with_weights.append((sig, col))
+                    
+        # 5. 生成压缩树 (CT) 网表文件
+        with open(output_file, 'w') as f:
+            f.write("module dadda_baseline_ct (\n")
+            inputs = [f"pp_in_{i}" for i in range(bit_width * bit_width)]
+            f.write(f"    input wire {', '.join(inputs)},\n")
+            outputs = [name for name, _ in outputs_with_weights]
+            f.write(f"    output wire {', '.join(outputs)}\n")
+            f.write(");\n\n")
+            
+            internal_wires = [f"comp_{i}_S" for i in range(comp_idx)] + [f"comp_{i}_CO" for i in range(comp_idx)]
+            internal_wires_to_declare = [w for w in internal_wires if w not in outputs]
+            
+            if internal_wires_to_declare:
+                f.write("    wire ")
+                for idx, w in enumerate(internal_wires_to_declare):
+                    f.write(w)
+                    if idx < len(internal_wires_to_declare) - 1:
+                        f.write(", ")
+                    if (idx + 1) % 10 == 0:
+                        f.write("\n         ")
+                f.write(";\n\n")
+                
+            if assign_lines:
+                f.write("\n".join(assign_lines) + "\n\n")
+                
+            f.write("\n".join(verilog_lines))
+            f.write("\nendmodule\n")
+
+        # 6. 巧妙复用已有的生成器，组装顶层乘法器 (Top Module)
+        original_tb_ports = self.tb_output_ports
+        self.tb_output_ports = outputs_with_weights
+        
+        # 显式指定对照组的 Top 模块名为 dadda_baseline_top
+        self.generate_multiplier_top(bit_width, top_file=top_file, ct_module_name="dadda_baseline_ct", top_module_name="dadda_baseline_top")
+        
+        self.tb_output_ports = original_tb_ports # 恢复现场
+        print(f"[BaselineGen] 纯血 Dadda 初始基准网表生成完毕！")
+        print(f"  -> CT 核心网表: {output_file}")
+        print(f"  -> Top 顶层装配: {top_file}")
 
 ```
 

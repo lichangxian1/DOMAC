@@ -11,41 +11,52 @@ class DOMACTrainer:
         self.model = model
         self.loss_engine = loss_engine
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
-        
-# [Dr. Gemini 的极权统治：初期只看速度和合法性]
+        # # [暴力修正] 让 P_c (物理门选择) 的变化速度比 M (连线拓扑) 快 5 倍！
+        # self.optimizer = optim.Adam([
+        #     {'params': [self.model.m_logits], 'lr': lr},
+        #     {'params': [self.model.p_logits], 'lr': lr * 5.0}  # 强行加速物理收敛
+        # ])
+
+        # self.hyperparams = {
+        #     't1': 10000.0,     # WNS 权重拉到极致，逼迫网络突破延迟极限
+        #     't2': 0.01,       # TNS 辅助全局路径寻优
+        #     'alpha': 3.0,    # 【封印】前期绝对不许管面积！
+        #     'lambda1': 0.1,  # 连线合法性是必须的
+        #     'lambda2': 0.5,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+        # }
+
         self.hyperparams = {
-            't1': 1.0,     # WNS 权重拉到极致，逼迫网络突破延迟极限
+            't1': 10.0,     # WNS 权重拉到极致，逼迫网络突破延迟极限
             't2': 0.01,       # TNS 辅助全局路径寻优
-            'alpha': 3.0,    # 【封印】前期绝对不许管面积！
+            'alpha': 0,    # 【封印】前期绝对不许管面积！
             'lambda1': 0.1,  # 连线合法性是必须的
-            'lambda2': 0.5,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+            'lambda2': 0,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
         }
+    # def update_hyperparameters(self, epoch):
+    #     if epoch >= 100:
+    #         self.hyperparams['alpha'] *= 1.003
+    #         self.hyperparams['t1'] *= 1.005
+    #         self.hyperparams['t2'] *= 1.005
+    #         self.hyperparams['lambda1'] *= 1.01
+    #         self.hyperparams['lambda2'] *= 1.01
 
     def update_hyperparameters(self, epoch):
-        if epoch >= 100:
-            self.hyperparams['alpha'] *= 1.003
-            self.hyperparams['t1'] *= 1.005
-            self.hyperparams['t2'] *= 1.005
-            self.hyperparams['lambda1'] *= 1.01
-            self.hyperparams['lambda2'] *= 1.01
-
-    # def update_hyperparameters(self, epoch):
-    #     """
-    #     动态退火调度器：分阶段释放约束
-    #     """
-    #     # 阶段 1 (Epoch 0-99)：野蛮生长，全力追求 WNS 和合法拓扑
+        """
+        动态退火调度器：分阶段释放约束
+        """
+        # 阶段 1 (Epoch 0-99)：野蛮生长，全力追求 WNS 和合法拓扑
         
-    #     # 阶段 2 (Epoch 100 触发)：拓扑基本成型，开始施加面积与二值化压力
-    #     if epoch == 100:
-    #         print("\n[Scheduler] Epoch 100 抵达！解封 Area 与 二值化 (L_D) 约束！")
-    #         self.hyperparams['alpha'] = 0.05   
-    #         self.hyperparams['lambda2'] = 0.1  
+        # 阶段 2 (Epoch 100 触发)：拓扑基本成型，开始施加面积与二值化压力
+        if epoch == 100:
+            print("\n[Scheduler] Epoch 100 抵达！解封 Area 与 二值化 (L_D) 约束！")
+            self.hyperparams['alpha'] = 0.05   
+            self.hyperparams['lambda2'] = 0.1  
             
-    #     # 阶段 3 (Epoch 100-300)：温水煮青蛙，逐步收紧离散化和合法性，逼迫最终坍缩
-    #     if epoch > 100:
-    #         self.hyperparams['lambda1'] *= 1.02  # 越来越严苛的合法性
-    #         self.hyperparams['lambda2'] *= 1.05  # 逼迫概率走向 0 或 1
-    #         self.hyperparams['alpha'] *= 1.005   # 轻微压缩面积
+        # 阶段 3 (Epoch 100-300)：温水煮青蛙，逐步收紧离散化和合法性，逼迫最终坍缩
+        if epoch > 100:
+            self.hyperparams['lambda1'] *= 1.02  # 越来越严苛的合法性
+            self.hyperparams['lambda2'] *= 1.05  # 逼迫概率走向 0 或 1
+            self.hyperparams['alpha'] *= 1.005   # 轻微压缩面积
 
     def train(self, pp_at, pp_slew, max_epochs=300):
         print(f"[Optimizer] 启动 DOMAC 训练循环，最大迭代次数: {max_epochs}")

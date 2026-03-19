@@ -33,6 +33,15 @@ class DOMAC_CompressorTree(nn.Module):
         
         # ... 后续的 p_logits, dag_mask 等代码保持不变 ...
         self.p_logits = nn.Parameter(torch.zeros(self.num_c, self.max_impls))
+        # # [暴力修正] 假设你的库排序是 D0, D1, D2, D4
+        # # 我们给 D2 (索引 2) 和 D4 (索引 3) 强行加上初始偏置，让 AI 开局就站在巨人的肩膀上
+        # init_logits = torch.zeros(self.num_c, self.max_impls)
+        # # 假设最大索引是 3 (对应 D4)
+        # if self.max_impls >= 4:
+        #     init_logits[:, 2] = 2.0  # 偏好 D2
+        #     init_logits[:, 3] = 40.0  # 极度偏好 D4
+            
+        self.p_logits = nn.Parameter(init_logits)
         p_mask = torch.zeros(self.num_c, self.max_impls)
         active_pin_mask = torch.zeros(self.num_c * self.num_pins_per_c)
         
