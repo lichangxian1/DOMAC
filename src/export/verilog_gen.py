@@ -183,6 +183,93 @@ class VerilogGenerator:
             
             f.write("        $finish;\n")
             f.write("    end\n")
+            f.write("endmodule\n")        
+        print(f"[VerilogGen] Testbench 可视化升级完毕！")
+
+    def generate_multiplier_top(self, bit_width, top_file="domac_multiplier_top.v", ct_module_name="domac_compressor_tree"):
+        """
+        [Dr. Gemini 终极装配线] 自动生成完整的乘法器顶层封装模块
+        包含: PPG (部分积生成阵列) + CT (DOMAC 压缩树) + CPA (末级加法器)
+        """
+        print(f"[VerilogGen] 正在组装完整乘法器顶层模块: {top_file}")
+        
+        out_width = bit_width * 2
+        
+        with open(top_file, 'w') as f:
+            f.write(f"`timescale 1ns/1ps\n\n")
+            f.write(f"module domac_multiplier_top (\n")
+            f.write(f"    input  wire [{bit_width-1}:0] A,\n")
+            f.write(f"    input  wire [{bit_width-1}:0] B,\n")
+            f.write(f"    output wire [{out_width-1}:0] P\n")
+            f.write(f");\n\n")
+            
+            f.write("    // ==========================================\n")
+            f.write("    // 1. Partial Product Generator (PPG) 阵列\n")
+            f.write("    // ==========================================\n")
+            pp_wire_names = []
+            k = 0
+            for i in range(bit_width):
+                for j in range(bit_width):
+                    wire_name = f"pp_in_{k}"
+                    pp_wire_names.append(wire_name)
+                    # 硬件并行生成部分积：A的第i位 AND B的第j位
+                    f.write(f"    wire {wire_name} = A[{i}] & B[{j}];\n")
+                    k += 1
+            f.write("\n")
+            
+            f.write("    // ==========================================\n")
+            f.write("    // 2. DOMAC AI 优化压缩树 (CT)\n")
+            f.write("    // ==========================================\n")
+            # 声明 CT 输出的那些毫无规律的杂散线
+            out_wires = [port[0] for port in self.tb_output_ports]
+            f.write(f"    wire {', '.join(out_wires)};\n\n")
+            
+            f.write(f"    {ct_module_name} U_CT (\n")
+            
+            # 绑定输入
+            port_bindings = []
+            for i in range(self.num_pp):
+                port_bindings.append(f"        .pp_in_{i}(pp_in_{i})")
+            
+            # 绑定输出
+            for out_name in out_wires:
+                port_bindings.append(f"        .{out_name}({out_name})")
+                
+            f.write(",\n".join(port_bindings) + "\n")
+            f.write("    );\n\n")
+            
+            f.write("    // ==========================================\n")
+            f.write("    // 3. Carry-Propagate Adder (CPA) 加法器\n")
+            f.write("    // ==========================================\n")
+            f.write("    // 将压缩树残留的杂散信号按二进制权重对齐重建，送入高速 CPA\n")
+            
+            # 分类收集不同权重的信号
+            col_signals = {w: [] for w in range(out_width)}
+            for out_name, weight in self.tb_output_ports:
+                col_signals[weight].append(out_name)
+                
+            # 动态重建向量: 保证能够被标准的 assign P = vec0 + vec1 完美吸收
+            # 如果某列刚好压缩到剩 2 根线，这里就会生成 vec_0 和 vec_1 两个 32-bit 向量
+            max_depth = max([len(sigs) for sigs in col_signals.values()])
+            
+            vec_names = []
+            for d in range(max_depth):
+                vec_name = f"cpa_vec_{d}"
+                vec_names.append(vec_name)
+                f.write(f"    wire [{out_width-1}:0] {vec_name};\n")
+                
+                # 为该向量的每一位赋值
+                for w in range(out_width):
+                    if d < len(col_signals[w]):
+                        f.write(f"    assign {vec_name}[{w}] = {col_signals[w][d]};\n")
+                    else:
+                        f.write(f"    assign {vec_name}[{w}] = 1'b0; // 缺位补零\n")
+                f.write("\n")
+            
+            f.write("    // 综合工具 (Design Compiler) 会将下述加法自动推断为极速并行前缀加法器\n")
+            sum_expr = " + ".join(vec_names)
+            f.write(f"    assign P = {sum_expr};\n\n")
+            
             f.write("endmodule\n")
             
-        print(f"[VerilogGen] Testbench 可视化升级完毕！")
+        print(f"[VerilogGen] 顶层模块封装完毕！可直接送入综合工具。")

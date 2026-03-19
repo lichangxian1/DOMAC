@@ -3,13 +3,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class DOMACLossFunction(nn.Module):
-    def __init__(self, pin_counts_lib=[3.0, 2.0]):
-        """
-        DOMAC 联合目标与约束损失函数引擎
-        """
+    # def __init__(self, pin_counts_lib=[3.0, 2.0]):
+    #     """
+    #     DOMAC 联合目标与约束损失函数引擎
+    #     """
+    #     super(DOMACLossFunction, self).__init__()
+    #     self.pin_counts = torch.tensor(pin_counts_lib, dtype=torch.float32)
+    def __init__(self, target_sink_count, pin_counts_lib=[3.0, 2.0]): # 接收动态目标
         super(DOMACLossFunction, self).__init__()
+        self.target_sink_count = target_sink_count
         self.pin_counts = torch.tensor(pin_counts_lib, dtype=torch.float32)
-        
+
     def calc_performance_loss(self, wns, tns, area, t1, t2, alpha):
         """
         1. 性能驱动损失 (Performance Objective)
@@ -59,7 +63,7 @@ class DOMACLossFunction(nn.Module):
         """
         return torch.sum((tensor ** 2) * ((1.0 - tensor) ** 2))
 
-    def calc_sink_loss(self, M_internal, target_max_signals=2.0):
+    def calc_sink_loss(self, M_internal, target_max_signals):
         """
         4. [新增] 过度输出惩罚 (Sink Constraint Loss)
         逼迫 AI 使用全加器进行压缩。如果最终流向 Sink 的期望信号数超过限制，施加核弹级惩罚！
@@ -103,7 +107,7 @@ class DOMACLossFunction(nn.Module):
         
         # 4. Sink 惩罚 Loss
         # 我们希望最终整个乘法器这列最多只留 2 个信号给底部的加法器
-        l_sink, actual_sink_count = self.calc_sink_loss(M, target_max_signals=62.0)
+        l_sink, actual_sink_count = self.calc_sink_loss(M, target_max_signals=self.target_sink_count)
         
         # 5. 总 Loss 融合
         l_bm_norm = l_bm / (l_bm.detach() + 1e-5)

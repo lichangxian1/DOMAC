@@ -89,11 +89,46 @@ class DOMAC_CompressorTree(nn.Module):
         index_1_slew = ref_arc['index_1_slew']
         index_2_load = ref_arc['index_2_load']
 
-        for ct in tensors:
-            areas.append(ct.get('cell_area', 1.0))
-            p_caps = [ct.get('pin_cap', {}).get(p, 0.001) for p in self.pin_names]
+        # for ct in tensors:
+        #     areas.append(ct.get('cell_area', 1.0))
+        #     p_caps = [ct.get('pin_cap', {}).get(p, 0.001) for p in self.pin_names]
+        #     caps.append(p_caps)
+
+        #     for out_p in ['S', 'CO']:
+        #         for in_p in self.pin_names:
+        #             arc = ct.get(out_p, {}).get(in_p)
+        #             if arc:
+        #                 stacked_arcs[out_p][in_p]['delay_lut'].append(arc['delay_lut'])
+        #                 stacked_arcs[out_p][in_p]['slew_lut'].append(arc['slew_lut'])
+        #             else:
+        #                 stacked_arcs[out_p][in_p]['delay_lut'].append(torch.full((7,7), 10.0))
+        #                 stacked_arcs[out_p][in_p]['slew_lut'].append(torch.full((7,7), 10.0))
+        for ct_idx, ct in enumerate(tensors):
+            # ==========================================================
+            # 1. 严格面积审查 (拒绝默认值 1.0)
+            # ==========================================================
+            if 'cell_area' not in ct:
+                raise ValueError(f"[Fatal] 物理库审查失败: 传入的第 {ct_idx} 个单元缺失面积(cell_area)数据！")
+            areas.append(ct['cell_area'])
+            
+            # ==========================================================
+            # 2. 严格电容审查 (拒绝默认值 0.001)
+            # ==========================================================
+            p_caps = []
+            for p in self.pin_names:
+                if p not in ct.get('pin_cap', {}):
+                    # 如果是 CI 引脚缺失，且当前单元可能是半加器(HA)，合法，用 0.0 填充
+                    if p == 'CI':
+                        p_caps.append(0.0)
+                    else:
+                        raise ValueError(f"[Fatal] 物理库审查失败: 单元缺失必须引脚 '{p}' 的电容数据！")
+                else:
+                    p_caps.append(ct['pin_cap'][p])
             caps.append(p_caps)
 
+            # ==========================================================
+            # 3. 严格时序弧审查 (拒绝伪造 10.0ns 的惩罚延迟)
+            # ==========================================================
             for out_p in ['S', 'CO']:
                 for in_p in self.pin_names:
                     arc = ct.get(out_p, {}).get(in_p)
@@ -101,9 +136,11 @@ class DOMAC_CompressorTree(nn.Module):
                         stacked_arcs[out_p][in_p]['delay_lut'].append(arc['delay_lut'])
                         stacked_arcs[out_p][in_p]['slew_lut'].append(arc['slew_lut'])
                     else:
-                        stacked_arcs[out_p][in_p]['delay_lut'].append(torch.full((7,7), 10.0))
-                        stacked_arcs[out_p][in_p]['slew_lut'].append(torch.full((7,7), 10.0))
-
+                        # 物理上确实不存在的路径 (例如 HA 的 CI->S)，填入全 0 张量。
+                        # 在 forward 时，这些路径会被 active_pin_mask 屏蔽，所以填 0 是物理合法的
+                        dummy_lut = torch.zeros((7,7))
+                        stacked_arcs[out_p][in_p]['delay_lut'].append(dummy_lut)
+                        stacked_arcs[out_p][in_p]['slew_lut'].append(dummy_lut)
         # =========================================================================
         # [核弹级显存挂载] 强行把嵌套在字典里的 3D 物理矩阵全部搬运到 GPU 显存上！
         for out_p in ['S', 'CO']:
@@ -184,11 +221,15 @@ class DOMAC_CompressorTree(nn.Module):
                     co_paths_at.append(pin_ats[p_idx] + torch.sum(P_j * delays_CO))
                     co_paths_slew.append(torch.sum(P_j * slews_CO))
 
-            expected_s_at = smooth_max_lse(s_paths_at, gamma=0.01) if s_paths_at else torch.tensor(10.0, device=P_c.device)
-            expected_s_slew = smooth_max_lse(s_paths_slew, gamma=0.01) if s_paths_at else torch.tensor(10.0, device=P_c.device)
-            expected_co_at = smooth_max_lse(co_paths_at, gamma=0.01) if co_paths_at else torch.tensor(10.0, device=P_c.device)
-            expected_co_slew = smooth_max_lse(co_paths_slew, gamma=0.01) if co_paths_at else torch.tensor(10.0, device=P_c.device)
-            
+            # expected_s_at = smooth_max_lse(s_paths_at, gamma=0.01) if s_paths_at else torch.tensor(10.0, device=P_c.device)
+            # expected_s_slew = smooth_max_lse(s_paths_slew, gamma=0.01) if s_paths_at else torch.tensor(10.0, device=P_c.device)
+            # expected_co_at = smooth_max_lse(co_paths_at, gamma=0.01) if co_paths_at else torch.tensor(10.0, device=P_c.device)
+            # expected_co_slew = smooth_max_lse(co_paths_slew, gamma=0.01) if co_paths_at else torch.tensor(10.0, device=P_c.device)
+            # 如果某输出引脚没有任何合法输入路径，到达时间应当是 0.0 而不是惩罚性的 10.0ns
+            expected_s_at = smooth_max_lse(s_paths_at, gamma=0.01) if s_paths_at else torch.tensor(0.0, device=P_c.device)
+            expected_s_slew = smooth_max_lse(s_paths_slew, gamma=0.01) if s_paths_slew else torch.tensor(0.0, device=P_c.device)
+            expected_co_at = smooth_max_lse(co_paths_at, gamma=0.01) if co_paths_at else torch.tensor(0.0, device=P_c.device)
+            expected_co_slew = smooth_max_lse(co_paths_slew, gamma=0.01) if co_paths_slew else torch.tensor(0.0, device=P_c.device)
             # =========================================================================
             # 3. [核弹级推送] 本节点算完后，直接通过 M_internal 一波推给所有未来的潜在下游引脚！
             # a = a + b 是安全的 out-of-place 加法，完美保留 Autograd 梯度！

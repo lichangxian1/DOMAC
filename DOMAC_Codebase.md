@@ -9,6 +9,7 @@ import os
 import sys
 import torch
 import time
+import subprocess
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -34,34 +35,90 @@ def create_physical_tensor_mock():
     return [fa_base, fa_base, fa_base], [ha_base, ha_base]
 
 def generate_multiplier_canvas(bit_width):
-    print(f"\n[Canvas Generator] 自动推演 {bit_width}x{bit_width} 乘法器画布...")
+    print(f"\n[Canvas Generator] 自动推演 {bit_width}x{bit_width} 乘法器画布 (严格 Dadda Tree 算法)...")
     pp_cols = []
     max_cols = bit_width * 2 - 1
     dots_in_col = [0] * max_cols
     
+    # 1. 生成初始部分积 (Partial Products) 矩阵
     for i in range(bit_width):
         for j in range(bit_width):
             col = i + j
             pp_cols.append(col)
             dots_in_col[col] += 1
             
-    print(f" -> 共 {len(pp_cols)} 个 PP 节点。各列点数分布: {dots_in_col}")
+    print(f" -> 共 {len(pp_cols)} 个 PP 节点。初始点数分布:\n    {dots_in_col}")
     
-    comp_cols = []
-    c_types = []
+    # 2. 计算 Dadda 树的目标高度序列 (2, 3, 4, 6, 9, 13, 19, 28...)
+    dadda_seq = [2]
+    while dadda_seq[-1] < bit_width:
+        dadda_seq.append(int(dadda_seq[-1] * 1.5))
+    dadda_seq.reverse() 
+    
+    # 过滤掉大于等于当前最大高度的目标，只保留真正需要压缩的阶段
+    targets = [t for t in dadda_seq if t < max(dots_in_col)]
+    print(f" -> Dadda 目标高度收敛序列: {targets}")
+    
+    comp_cols_raw = []
+    c_types_raw = []
     current_dots = list(dots_in_col)
     
-    for col in range(max_cols):
-        while current_dots[col] > 2:
-            comp_cols.append(col) 
-            c_types.append('FA') # 默认申请 FA 坑位
-            current_dots[col] -= 3 
-            current_dots[col] += 1 
-            if col + 1 < max_cols:
-                current_dots[col + 1] += 1 
+    # 3. 按目标高度逐级扫荡压缩
+    for stage_idx, target in enumerate(targets):
+        current_len = len(current_dots)
+        next_dots = [0] * current_len
+        carry_from_prev = 0
+        
+        for col in range(current_len):
+            V = current_dots[col]
+            # 当前列在下一级期望达到的高度边界 (扣除上一列传来的进位后，本列允许留下的节点数)
+            allowed_output = target - carry_from_prev
+            
+            if V > allowed_output:
+                # 需要通过引入压缩器来削减的点数
+                reduction_needed = V - allowed_output
                 
-    print(f" -> 申请 {len(comp_cols)} 个压缩器画布。")
-    return sorted(pp_cols), sorted(comp_cols), c_types
+                # 贪心分配：1 个 FA 削减 2 个高度，1 个 HA 削减 1 个高度
+                f = reduction_needed // 2
+                h = reduction_needed % 2
+                
+                for _ in range(f):
+                    comp_cols_raw.append(col)
+                    c_types_raw.append('FA')
+                for _ in range(h):
+                    comp_cols_raw.append(col)
+                    c_types_raw.append('HA')
+                    
+                # 本列保留的点数 = 原有数量 - 削减的高度
+                dots_stay = V - reduction_needed
+                next_dots[col] = dots_stay + carry_from_prev
+                carry_from_prev = f + h
+            else:
+                # 不需要压缩，全部透传，加上进位
+                next_dots[col] = V + carry_from_prev
+                carry_from_prev = 0
+                
+        # 最后一个进位如果存在，顺延到最高位的下一列
+        if carry_from_prev > 0:
+            next_dots.append(carry_from_prev)
+            
+        current_dots = next_dots
+        
+    final_max = max(current_dots)
+    print(f" -> 压缩完毕！最终最大高度: {final_max}。")
+    print(f" -> 申请 {len(comp_cols_raw)} 个压缩器画布 ({c_types_raw.count('FA')} FA, {c_types_raw.count('HA')} HA)。")
+    
+    if final_max > 2:
+        print("\n[致命警告] Dadda 树未能将高度压缩至 2！请检查位宽逻辑。")
+        
+    # 4. [高危漏洞修复] 安全地将坑位和物理类型进行联合排序 (Zip Sort)
+    # 确保无论 Stage 怎么穿插，列索引和分配给该列的门类型永远死死绑定
+    combined = sorted(zip(comp_cols_raw, c_types_raw), key=lambda x: x[0])
+    comp_cols = [x[0] for x in combined]
+    c_types = [x[1] for x in combined]
+
+    return pp_cols, comp_cols, c_types
+    
 
 def main():
     print("="*60)
@@ -86,15 +143,18 @@ def main():
             fa_tensors = [nldm_db[c] for c in TARGET_CELLS if c.startswith('FA') and c in nldm_db]
             ha_tensors = [nldm_db[c] for c in TARGET_CELLS if c.startswith('HA') and c in nldm_db]
         else:
-            raise FileNotFoundError
+            raise FileNotFoundError(f"找不到指定的工艺库文件: {lib_path}")
     except Exception as e:
-        print(f"\n[System] PDK 异常，切换【物理对齐 Mock 模式】...")
-        fa_tensors, ha_tensors = create_physical_tensor_mock()
-        # Mock 模式下必须伪造同样数量的名字给 Verilog 生成器，否则会越界崩溃
-        fa_names = [f"Mock_FA_Impl_{i}" for i in range(len(fa_tensors))]
-        ha_names = [f"Mock_HA_Impl_{i}" for i in range(len(ha_tensors))]
-
-    BIT_WIDTH = 16
+        # print(f"\n[System] PDK 异常，切换【物理对齐 Mock 模式】...")
+        # fa_tensors, ha_tensors = create_physical_tensor_mock()
+        # # Mock 模式下必须伪造同样数量的名字给 Verilog 生成器，否则会越界崩溃
+        # fa_names = [f"Mock_FA_Impl_{i}" for i in range(len(fa_tensors))]
+        # ha_names = [f"Mock_HA_Impl_{i}" for i in range(len(ha_tensors))]
+        print(f"\n[Fatal Error] 系统初始化失败，拒绝以非严谨模式运行。原因: {e}")
+        sys.exit(1)
+        
+    BIT_WIDTH = 8
+    TARGET_SINK_COUNT = (BIT_WIDTH * 2 - 1) * 2
     PP_COLS, COMP_COLS, C_TYPES = generate_multiplier_canvas(BIT_WIDTH)
     NUM_PP = len(PP_COLS)
     NUM_COMPRESSORS = len(COMP_COLS)
@@ -124,15 +184,17 @@ def main():
 
     # 1. 初始信号输入必须在显存上创建
     pp_at = torch.linspace(0.0, 0.1, NUM_PP, device=device) 
-    pp_slew = torch.full((NUM_PP,), 0.05, device=device)
-    REQ_TIME = 0.1 
+    pp_slew = torch.full((NUM_PP,), 0.02, device=device)
+    REQ_TIME = 0 
     print("REQ_TIME：" + str(REQ_TIME))
 
     print(f"\n[Engine] 构建异构可微压缩树...")
     # 2. 传递 device 给模型，并强制模型所有 Parameter 和 Buffer 上 GPU
     model = DOMAC_CompressorTree(PP_COLS, COMP_COLS, fa_tensors, ha_tensors, C_TYPES, REQ_TIME, device=device).to(device)
 
-    loss_engine = DOMACLossFunction()
+    # loss_engine = DOMACLossFunction()
+    # 将动态约束传入 Loss 引擎
+    loss_engine = DOMACLossFunction(target_sink_count=TARGET_SINK_COUNT)
     trainer = DOMACTrainer(model, loss_engine, lr=0.05)
     
     print("\n[Engine] 物理映射与梯度反向传播开始...")
@@ -193,12 +255,44 @@ def main():
     
     v_gen.generate(discrete_M, discrete_P, output_file=netlist_path)
     v_gen.generate_testbench(tb_file=tb_path, netlist_file=netlist_path)
-    
+    # ================= [新增模块组装] =================
+    top_path = "output/netlists/domac_multiplier_top.v"
+    v_gen.generate_multiplier_top(
+        bit_width=BIT_WIDTH, 
+        top_file=top_path, 
+        ct_module_name="domac_compressor_tree"
+    )
+
     end_time = time.time()
     print("="*60)
     print(f" [任务完成] 全流程跑通，总耗时: {end_time - start_time:.2f} 秒")
     print(f" 请前往 output/netlists/domac_result.v 查看流片网表。")
     print("="*60)
+
+# ================= [新增：跨服一键发射模块] =================
+    print("\n[System] 启动跨服传输，正在将网表发射至 GPU 仿真服务器...")
+    
+    # 构造 rsync 命令
+    # 注意: output/netlists/ 末尾的斜杠表示同步文件夹内部的所有文件，而不是文件夹本身
+    rsync_cmd = [
+        "rsync", "-avzP",
+        "output/netlists/", 
+        "-e", "ssh -p 16822",
+        "lchangxian@202.120.39.27:/home/lchangxian/powerSimPlatform/src/rtl/"
+    ]
+    
+    try:
+        # 启动子进程执行传输，保留终端的实时输出 (stdout/stderr)
+        subprocess.run(rsync_cmd, check=True)
+        print("="*60)
+        print("[System] 🚀 跨服投递成功！")
+        print("所有 RTL 网表已安全降落在 powerSimPlatform/src/rtl/ 目录下，准备好进行功耗评估！")
+        print("="*60)
+    except subprocess.CalledProcessError as e:
+        print(f"\n[Fatal Error] 传输任务坠毁！rsync 返回了非零状态码: {e.returncode}")
+        print("-> 建议检查: 1. 服务器网络是否畅通 2. SSH 端口和用户名是否正确。")
+    except FileNotFoundError:
+        print("\n[Fatal Error] 本地系统未找到 rsync 命令，请先运行 sudo apt install rsync 安装。")
 
 if __name__ == "__main__":
     # 开启 PyTorch 的异常检测，用于排查任何可能的梯度断裂
@@ -428,38 +522,38 @@ class DOMACTrainer:
         
 # [Dr. Gemini 的极权统治：初期只看速度和合法性]
         self.hyperparams = {
-            't1': 100.0,     # WNS 权重拉到极致，逼迫网络突破延迟极限
-            't2': 1.0,       # TNS 辅助全局路径寻优
-            'alpha': 0.0,    # 【封印】前期绝对不许管面积！
-            'lambda1': 1.0,  # 连线合法性是必须的
-            'lambda2': 0.0,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+            't1': 1.0,     # WNS 权重拉到极致，逼迫网络突破延迟极限
+            't2': 0.01,       # TNS 辅助全局路径寻优
+            'alpha': 3.0,    # 【封印】前期绝对不许管面积！
+            'lambda1': 0.1,  # 连线合法性是必须的
+            'lambda2': 0.5,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
         }
 
-    # def update_hyperparameters(self, epoch):
-    #     if epoch >= 100:
-    #         self.hyperparams['alpha'] *= 1.003
-    #         self.hyperparams['t1'] *= 1.005
-    #         self.hyperparams['t2'] *= 1.005
-    #         self.hyperparams['lambda1'] *= 1.01
-    #         self.hyperparams['lambda2'] *= 1.01
-
     def update_hyperparameters(self, epoch):
-        """
-        动态退火调度器：分阶段释放约束
-        """
-        # 阶段 1 (Epoch 0-99)：野蛮生长，全力追求 WNS 和合法拓扑
+        if epoch >= 100:
+            self.hyperparams['alpha'] *= 1.003
+            self.hyperparams['t1'] *= 1.005
+            self.hyperparams['t2'] *= 1.005
+            self.hyperparams['lambda1'] *= 1.01
+            self.hyperparams['lambda2'] *= 1.01
+
+    # def update_hyperparameters(self, epoch):
+    #     """
+    #     动态退火调度器：分阶段释放约束
+    #     """
+    #     # 阶段 1 (Epoch 0-99)：野蛮生长，全力追求 WNS 和合法拓扑
         
-        # 阶段 2 (Epoch 100 触发)：拓扑基本成型，开始施加面积与二值化压力
-        if epoch == 100:
-            print("\n[Scheduler] Epoch 100 抵达！解封 Area 与 二值化 (L_D) 约束！")
-            self.hyperparams['alpha'] = 0.05   
-            self.hyperparams['lambda2'] = 0.1  
+    #     # 阶段 2 (Epoch 100 触发)：拓扑基本成型，开始施加面积与二值化压力
+    #     if epoch == 100:
+    #         print("\n[Scheduler] Epoch 100 抵达！解封 Area 与 二值化 (L_D) 约束！")
+    #         self.hyperparams['alpha'] = 0.05   
+    #         self.hyperparams['lambda2'] = 0.1  
             
-        # 阶段 3 (Epoch 100-300)：温水煮青蛙，逐步收紧离散化和合法性，逼迫最终坍缩
-        if epoch > 100:
-            self.hyperparams['lambda1'] *= 1.02  # 越来越严苛的合法性
-            self.hyperparams['lambda2'] *= 1.05  # 逼迫概率走向 0 或 1
-            self.hyperparams['alpha'] *= 1.005   # 轻微压缩面积
+    #     # 阶段 3 (Epoch 100-300)：温水煮青蛙，逐步收紧离散化和合法性，逼迫最终坍缩
+    #     if epoch > 100:
+    #         self.hyperparams['lambda1'] *= 1.02  # 越来越严苛的合法性
+    #         self.hyperparams['lambda2'] *= 1.05  # 逼迫概率走向 0 或 1
+    #         self.hyperparams['alpha'] *= 1.005   # 轻微压缩面积
 
     def train(self, pp_at, pp_slew, max_epochs=300):
         print(f"[Optimizer] 启动 DOMAC 训练循环，最大迭代次数: {max_epochs}")
@@ -500,7 +594,7 @@ class DOMACTrainer:
             acc_step += (t4 - t3)
             
             # 每 20 步打印一次物理指标与性能报告
-            if epoch % 5 == 0 or epoch == max_epochs - 1:
+            if epoch % 20 == 0 or epoch == max_epochs - 1:
                 print(f"\nEpoch {epoch:03d} | "
                       f"WNS: {loss_dict['wns'].item():.4f} | "
                       f"Area: {loss_dict['area'].item():.4f} | "
@@ -703,11 +797,46 @@ class DOMAC_CompressorTree(nn.Module):
         index_1_slew = ref_arc['index_1_slew']
         index_2_load = ref_arc['index_2_load']
 
-        for ct in tensors:
-            areas.append(ct.get('cell_area', 1.0))
-            p_caps = [ct.get('pin_cap', {}).get(p, 0.001) for p in self.pin_names]
+        # for ct in tensors:
+        #     areas.append(ct.get('cell_area', 1.0))
+        #     p_caps = [ct.get('pin_cap', {}).get(p, 0.001) for p in self.pin_names]
+        #     caps.append(p_caps)
+
+        #     for out_p in ['S', 'CO']:
+        #         for in_p in self.pin_names:
+        #             arc = ct.get(out_p, {}).get(in_p)
+        #             if arc:
+        #                 stacked_arcs[out_p][in_p]['delay_lut'].append(arc['delay_lut'])
+        #                 stacked_arcs[out_p][in_p]['slew_lut'].append(arc['slew_lut'])
+        #             else:
+        #                 stacked_arcs[out_p][in_p]['delay_lut'].append(torch.full((7,7), 10.0))
+        #                 stacked_arcs[out_p][in_p]['slew_lut'].append(torch.full((7,7), 10.0))
+        for ct_idx, ct in enumerate(tensors):
+            # ==========================================================
+            # 1. 严格面积审查 (拒绝默认值 1.0)
+            # ==========================================================
+            if 'cell_area' not in ct:
+                raise ValueError(f"[Fatal] 物理库审查失败: 传入的第 {ct_idx} 个单元缺失面积(cell_area)数据！")
+            areas.append(ct['cell_area'])
+            
+            # ==========================================================
+            # 2. 严格电容审查 (拒绝默认值 0.001)
+            # ==========================================================
+            p_caps = []
+            for p in self.pin_names:
+                if p not in ct.get('pin_cap', {}):
+                    # 如果是 CI 引脚缺失，且当前单元可能是半加器(HA)，合法，用 0.0 填充
+                    if p == 'CI':
+                        p_caps.append(0.0)
+                    else:
+                        raise ValueError(f"[Fatal] 物理库审查失败: 单元缺失必须引脚 '{p}' 的电容数据！")
+                else:
+                    p_caps.append(ct['pin_cap'][p])
             caps.append(p_caps)
 
+            # ==========================================================
+            # 3. 严格时序弧审查 (拒绝伪造 10.0ns 的惩罚延迟)
+            # ==========================================================
             for out_p in ['S', 'CO']:
                 for in_p in self.pin_names:
                     arc = ct.get(out_p, {}).get(in_p)
@@ -715,9 +844,11 @@ class DOMAC_CompressorTree(nn.Module):
                         stacked_arcs[out_p][in_p]['delay_lut'].append(arc['delay_lut'])
                         stacked_arcs[out_p][in_p]['slew_lut'].append(arc['slew_lut'])
                     else:
-                        stacked_arcs[out_p][in_p]['delay_lut'].append(torch.full((7,7), 10.0))
-                        stacked_arcs[out_p][in_p]['slew_lut'].append(torch.full((7,7), 10.0))
-
+                        # 物理上确实不存在的路径 (例如 HA 的 CI->S)，填入全 0 张量。
+                        # 在 forward 时，这些路径会被 active_pin_mask 屏蔽，所以填 0 是物理合法的
+                        dummy_lut = torch.zeros((7,7))
+                        stacked_arcs[out_p][in_p]['delay_lut'].append(dummy_lut)
+                        stacked_arcs[out_p][in_p]['slew_lut'].append(dummy_lut)
         # =========================================================================
         # [核弹级显存挂载] 强行把嵌套在字典里的 3D 物理矩阵全部搬运到 GPU 显存上！
         for out_p in ['S', 'CO']:
@@ -751,9 +882,14 @@ class DOMAC_CompressorTree(nn.Module):
         flat_expected_pin_caps = torch.cat(expected_pin_caps_list)
         loads = M_internal @ flat_expected_pin_caps 
         
-        pp_ats_t = torch.stack(list(pp_at))
-        pp_slews_t = torch.stack(list(pp_slew))
-        
+        # =========================================================================
+        # [Dr. Gemini 降维打击：Push 前向广播范式]
+        # 1. 初始时刻：只利用外部输入的 PP 信号，一波推给压缩树的所有引脚进行打底！
+        m_pp_all = M_internal[:self.num_pp, :]
+        pin_ats_all = pp_at @ m_pp_all
+        pin_slews_all = pp_slew @ m_pp_all
+        # =========================================================================
+
         s_ats, s_slews = [], []
         co_ats, co_slews = [], []
 
@@ -761,22 +897,10 @@ class DOMAC_CompressorTree(nn.Module):
             col_start = j * self.num_pins_per_c
             col_end = col_start + self.num_pins_per_c
             
-            m_pp = M_internal[:self.num_pp, col_start:col_end]
-            pin_ats = pp_ats_t @ m_pp
-            pin_slews = pp_slews_t @ m_pp
-            
-            if j > 0:
-                s_ats_t = torch.stack(s_ats)
-                s_slews_t = torch.stack(s_slews)
-                m_s = M_internal[self.num_pp : self.num_pp + j, col_start:col_end]
-                pin_ats = pin_ats + s_ats_t @ m_s
-                pin_slews = pin_slews + s_slews_t @ m_s
-                
-                co_ats_t = torch.stack(co_ats)
-                co_slews_t = torch.stack(co_slews)
-                m_co = M_internal[self.num_pp + self.num_c : self.num_pp + self.num_c + j, col_start:col_end]
-                pin_ats = pin_ats + co_ats_t @ m_co
-                pin_slews = pin_slews + co_slews_t @ m_co
+            # 2. 坐享其成：当前压缩器的输入引脚时序，早已被前面的兄弟计算好并推送过来了！
+            # 彻底消灭了 O(N^2) 的 torch.stack 和切片！
+            pin_ats = pin_ats_all[col_start:col_end]
+            pin_slews = pin_slews_all[col_start:col_end]
 
             s_load = loads[self.num_pp + j]
             co_load = loads[self.num_pp + self.num_c + j]
@@ -791,37 +915,48 @@ class DOMAC_CompressorTree(nn.Module):
             for p_idx, p_name in enumerate(self.pin_names):
                 if self.active_pin_mask[j * 3 + p_idx] > 0.5:
                     
-                    # =========================================================================
-                    # [核弹级向量化] S 弧延迟计算 (无需 for 循环，一次插出 4 种门的数值！)
                     arc_S = cell_arcs['S'][p_name]
                     delays_S = diff_bilinear_interp(pin_slews[p_idx], s_load, arc_S['index_1_slew'], arc_S['index_2_load'], arc_S['delay_lut'])
                     slews_S = diff_bilinear_interp(pin_slews[p_idx], s_load, arc_S['index_1_slew'], arc_S['index_2_load'], arc_S['slew_lut'])
                     
-                    # 直接点乘概率矩阵，收割！
                     s_paths_at.append(pin_ats[p_idx] + torch.sum(P_j * delays_S))
                     s_paths_slew.append(torch.sum(P_j * slews_S))
                     
-                    # CO 弧同理
                     arc_CO = cell_arcs['CO'][p_name]
                     delays_CO = diff_bilinear_interp(pin_slews[p_idx], co_load, arc_CO['index_1_slew'], arc_CO['index_2_load'], arc_CO['delay_lut'])
                     slews_CO = diff_bilinear_interp(pin_slews[p_idx], co_load, arc_CO['index_1_slew'], arc_CO['index_2_load'], arc_CO['slew_lut'])
                     
                     co_paths_at.append(pin_ats[p_idx] + torch.sum(P_j * delays_CO))
                     co_paths_slew.append(torch.sum(P_j * slews_CO))
-                    # =========================================================================
 
-            expected_s_at = smooth_max_lse(s_paths_at, gamma=0.01) if s_paths_at else torch.tensor(10.0, device=P_c.device)
-            expected_s_slew = smooth_max_lse(s_paths_slew, gamma=0.01) if s_paths_at else torch.tensor(10.0, device=P_c.device)
-            expected_co_at = smooth_max_lse(co_paths_at, gamma=0.01) if co_paths_at else torch.tensor(10.0, device=P_c.device)
-            expected_co_slew = smooth_max_lse(co_paths_slew, gamma=0.01) if co_paths_at else torch.tensor(10.0, device=P_c.device)
+            # expected_s_at = smooth_max_lse(s_paths_at, gamma=0.01) if s_paths_at else torch.tensor(10.0, device=P_c.device)
+            # expected_s_slew = smooth_max_lse(s_paths_slew, gamma=0.01) if s_paths_at else torch.tensor(10.0, device=P_c.device)
+            # expected_co_at = smooth_max_lse(co_paths_at, gamma=0.01) if co_paths_at else torch.tensor(10.0, device=P_c.device)
+            # expected_co_slew = smooth_max_lse(co_paths_slew, gamma=0.01) if co_paths_at else torch.tensor(10.0, device=P_c.device)
+            # 如果某输出引脚没有任何合法输入路径，到达时间应当是 0.0 而不是惩罚性的 10.0ns
+            expected_s_at = smooth_max_lse(s_paths_at, gamma=0.01) if s_paths_at else torch.tensor(0.0, device=P_c.device)
+            expected_s_slew = smooth_max_lse(s_paths_slew, gamma=0.01) if s_paths_slew else torch.tensor(0.0, device=P_c.device)
+            expected_co_at = smooth_max_lse(co_paths_at, gamma=0.01) if co_paths_at else torch.tensor(0.0, device=P_c.device)
+            expected_co_slew = smooth_max_lse(co_paths_slew, gamma=0.01) if co_paths_slew else torch.tensor(0.0, device=P_c.device)
+            # =========================================================================
+            # 3. [核弹级推送] 本节点算完后，直接通过 M_internal 一波推给所有未来的潜在下游引脚！
+            # a = a + b 是安全的 out-of-place 加法，完美保留 Autograd 梯度！
+            pin_ats_all = pin_ats_all + expected_s_at * M_internal[self.num_pp + j, :]
+            pin_slews_all = pin_slews_all + expected_s_slew * M_internal[self.num_pp + j, :]
+            
+            pin_ats_all = pin_ats_all + expected_co_at * M_internal[self.num_pp + self.num_c + j, :]
+            pin_slews_all = pin_slews_all + expected_co_slew * M_internal[self.num_pp + self.num_c + j, :]
+            # =========================================================================
             
             s_ats.append(expected_s_at)
             s_slews.append(expected_s_slew)
             co_ats.append(expected_co_at)
             co_slews.append(expected_co_slew)
             
-        node_ats = list(pp_at) + s_ats + co_ats
-        all_ats_tensor = torch.stack(node_ats)
+        # 完美拼接，彻底消灭 list of tensors 导致的 O(N) 性能雪崩
+        s_ats_t = torch.stack(s_ats)
+        co_ats_t = torch.stack(co_ats)
+        all_ats_tensor = torch.cat([pp_at, s_ats_t, co_ats_t])
         
         slacks = self.req_time - all_ats_tensor
         negative_slacks = torch.clamp(slacks, max=0.0)
@@ -840,13 +975,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class DOMACLossFunction(nn.Module):
-    def __init__(self, pin_counts_lib=[3.0, 2.0]):
-        """
-        DOMAC 联合目标与约束损失函数引擎
-        """
+    # def __init__(self, pin_counts_lib=[3.0, 2.0]):
+    #     """
+    #     DOMAC 联合目标与约束损失函数引擎
+    #     """
+    #     super(DOMACLossFunction, self).__init__()
+    #     self.pin_counts = torch.tensor(pin_counts_lib, dtype=torch.float32)
+    def __init__(self, target_sink_count, pin_counts_lib=[3.0, 2.0]): # 接收动态目标
         super(DOMACLossFunction, self).__init__()
+        self.target_sink_count = target_sink_count
         self.pin_counts = torch.tensor(pin_counts_lib, dtype=torch.float32)
-        
+
     def calc_performance_loss(self, wns, tns, area, t1, t2, alpha):
         """
         1. 性能驱动损失 (Performance Objective)
@@ -896,7 +1035,7 @@ class DOMACLossFunction(nn.Module):
         """
         return torch.sum((tensor ** 2) * ((1.0 - tensor) ** 2))
 
-    def calc_sink_loss(self, M_internal, target_max_signals=2.0):
+    def calc_sink_loss(self, M_internal, target_max_signals):
         """
         4. [新增] 过度输出惩罚 (Sink Constraint Loss)
         逼迫 AI 使用全加器进行压缩。如果最终流向 Sink 的期望信号数超过限制，施加核弹级惩罚！
@@ -940,7 +1079,7 @@ class DOMACLossFunction(nn.Module):
         
         # 4. Sink 惩罚 Loss
         # 我们希望最终整个乘法器这列最多只留 2 个信号给底部的加法器
-        l_sink, actual_sink_count = self.calc_sink_loss(M, target_max_signals=62.0)
+        l_sink, actual_sink_count = self.calc_sink_loss(M, target_max_signals=self.target_sink_count)
         
         # 5. 总 Loss 融合
         l_bm_norm = l_bm / (l_bm.detach() + 1e-5)
@@ -1208,8 +1347,96 @@ class VerilogGenerator:
             
             f.write("        $finish;\n")
             f.write("    end\n")
+            f.write("endmodule\n")        
+        print(f"[VerilogGen] Testbench 可视化升级完毕！")
+
+    def generate_multiplier_top(self, bit_width, top_file="domac_multiplier_top.v", ct_module_name="domac_compressor_tree"):
+        """
+        [Dr. Gemini 终极装配线] 自动生成完整的乘法器顶层封装模块
+        包含: PPG (部分积生成阵列) + CT (DOMAC 压缩树) + CPA (末级加法器)
+        """
+        print(f"[VerilogGen] 正在组装完整乘法器顶层模块: {top_file}")
+        
+        out_width = bit_width * 2
+        
+        with open(top_file, 'w') as f:
+            f.write(f"`timescale 1ns/1ps\n\n")
+            f.write(f"module domac_multiplier_top (\n")
+            f.write(f"    input  wire [{bit_width-1}:0] A,\n")
+            f.write(f"    input  wire [{bit_width-1}:0] B,\n")
+            f.write(f"    output wire [{out_width-1}:0] P\n")
+            f.write(f");\n\n")
+            
+            f.write("    // ==========================================\n")
+            f.write("    // 1. Partial Product Generator (PPG) 阵列\n")
+            f.write("    // ==========================================\n")
+            pp_wire_names = []
+            k = 0
+            for i in range(bit_width):
+                for j in range(bit_width):
+                    wire_name = f"pp_in_{k}"
+                    pp_wire_names.append(wire_name)
+                    # 硬件并行生成部分积：A的第i位 AND B的第j位
+                    f.write(f"    wire {wire_name} = A[{i}] & B[{j}];\n")
+                    k += 1
+            f.write("\n")
+            
+            f.write("    // ==========================================\n")
+            f.write("    // 2. DOMAC AI 优化压缩树 (CT)\n")
+            f.write("    // ==========================================\n")
+            # 声明 CT 输出的那些毫无规律的杂散线
+            out_wires = [port[0] for port in self.tb_output_ports]
+            f.write(f"    wire {', '.join(out_wires)};\n\n")
+            
+            f.write(f"    {ct_module_name} U_CT (\n")
+            
+            # 绑定输入
+            port_bindings = []
+            for i in range(self.num_pp):
+                port_bindings.append(f"        .pp_in_{i}(pp_in_{i})")
+            
+            # 绑定输出
+            for out_name in out_wires:
+                port_bindings.append(f"        .{out_name}({out_name})")
+                
+            f.write(",\n".join(port_bindings) + "\n")
+            f.write("    );\n\n")
+            
+            f.write("    // ==========================================\n")
+            f.write("    // 3. Carry-Propagate Adder (CPA) 加法器\n")
+            f.write("    // ==========================================\n")
+            f.write("    // 将压缩树残留的杂散信号按二进制权重对齐重建，送入高速 CPA\n")
+            
+            # 分类收集不同权重的信号
+            col_signals = {w: [] for w in range(out_width)}
+            for out_name, weight in self.tb_output_ports:
+                col_signals[weight].append(out_name)
+                
+            # 动态重建向量: 保证能够被标准的 assign P = vec0 + vec1 完美吸收
+            # 如果某列刚好压缩到剩 2 根线，这里就会生成 vec_0 和 vec_1 两个 32-bit 向量
+            max_depth = max([len(sigs) for sigs in col_signals.values()])
+            
+            vec_names = []
+            for d in range(max_depth):
+                vec_name = f"cpa_vec_{d}"
+                vec_names.append(vec_name)
+                f.write(f"    wire [{out_width-1}:0] {vec_name};\n")
+                
+                # 为该向量的每一位赋值
+                for w in range(out_width):
+                    if d < len(col_signals[w]):
+                        f.write(f"    assign {vec_name}[{w}] = {col_signals[w][d]};\n")
+                    else:
+                        f.write(f"    assign {vec_name}[{w}] = 1'b0; // 缺位补零\n")
+                f.write("\n")
+            
+            f.write("    // 综合工具 (Design Compiler) 会将下述加法自动推断为极速并行前缀加法器\n")
+            sum_expr = " + ".join(vec_names)
+            f.write(f"    assign P = {sum_expr};\n\n")
+            
             f.write("endmodule\n")
             
-        print(f"[VerilogGen] Testbench 可视化升级完毕！")
+        print(f"[VerilogGen] 顶层模块封装完毕！可直接送入综合工具。")
+
 ```
 
