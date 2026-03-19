@@ -200,7 +200,8 @@ def main():
         torch.backends.cudnn.benchmark = True 
 
     # 1. 初始信号输入必须在显存上创建
-    pp_at = torch.linspace(0.0, 0.1, NUM_PP, device=device) 
+    # pp_at = torch.linspace(0.0, 0.1, NUM_PP, device=device) 
+    pp_at = torch.zeros(NUM_PP, device=device) 
     pp_slew = torch.full((NUM_PP,), 0.02, device=device)
     REQ_TIME = 0 
     print("REQ_TIME：" + str(REQ_TIME))
@@ -273,12 +274,12 @@ def main():
     v_gen.generate(discrete_M, discrete_P, output_file=netlist_path)
     v_gen.generate_testbench(tb_file=tb_path, netlist_file=netlist_path)
     # ================= [新增模块组装] =================
-    top_path = "output/netlists/domac_multiplier_top.v"
+    top_path = "output/netlists/domac.v"
     v_gen.generate_multiplier_top(
         bit_width=BIT_WIDTH, 
         top_file=top_path, 
         ct_module_name="domac_compressor_tree", 
-        top_module_name="domac_multiplier_top"
+        top_module_name="domac"
     )
     # ================= [新增：顺手生成纯血对照组网表] =================
     v_gen.generate_pure_dadda_baseline(

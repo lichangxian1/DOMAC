@@ -1,6 +1,6 @@
 `timescale 1ns/1ps
 
-module dadda_baseline_top (
+module dadda (
     input  wire [7:0] A,
     input  wire [7:0] B,
     output wire [15:0] P

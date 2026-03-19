@@ -186,9 +186,9 @@ class VerilogGenerator:
             f.write("endmodule\n")        
         print(f"[VerilogGen] Testbench 可视化升级完毕！")
 
-    def generate_multiplier_top(self, bit_width, top_file="domac_multiplier_top.v", ct_module_name="domac_compressor_tree", top_module_name="domac_multiplier_top"):
+    def generate_multiplier_top(self, bit_width, top_file="domac.v", ct_module_name="domac_compressor_tree", top_module_name="domac"):
         """
-        [Dr. Gemini 终极装配线] 自动生成完整的乘法器顶层封装模块
+        自动生成完整的乘法器顶层封装模块
         包含: PPG (部分积生成阵列) + CT (DOMAC 压缩树) + CPA (末级加法器)
         """
         print(f"[VerilogGen] 正在组装完整乘法器顶层模块: {top_file}")
@@ -274,7 +274,7 @@ class VerilogGenerator:
             
         print(f"[VerilogGen] 顶层模块封装完毕！可直接送入综合工具。")
 
-    def generate_pure_dadda_baseline(self, bit_width, output_file="dadda_baseline_ct.v", top_file="dadda_baseline_top.v"):
+    def generate_pure_dadda_baseline(self, bit_width, output_file="dadda_baseline_ct.v", top_file="dadda.v"):
         """
         [Dr. Gemini 基准线生成器] 直接输出纯正的 Dadda Tree 初始 Verilog 网表
         用于控制变量法对照实验 (Control Experiment)
@@ -404,8 +404,8 @@ class VerilogGenerator:
         original_tb_ports = self.tb_output_ports
         self.tb_output_ports = outputs_with_weights
         
-        # 显式指定对照组的 Top 模块名为 dadda_baseline_top
-        self.generate_multiplier_top(bit_width, top_file=top_file, ct_module_name="dadda_baseline_ct", top_module_name="dadda_baseline_top")
+        # 显式指定对照组的 Top 模块名为 dadda
+        self.generate_multiplier_top(bit_width, top_file=top_file, ct_module_name="dadda_baseline_ct", top_module_name="dadda")
         
         self.tb_output_ports = original_tb_ports # 恢复现场
         print(f"[BaselineGen] 纯血 Dadda 初始基准网表生成完毕！")

@@ -40,8 +40,8 @@ class DOMAC_CompressorTree(nn.Module):
         # if self.max_impls >= 4:
         #     init_logits[:, 2] = 2.0  # 偏好 D2
         #     init_logits[:, 3] = 40.0  # 极度偏好 D4
-            
-        self.p_logits = nn.Parameter(init_logits)
+        # self.p_logits = nn.Parameter(init_logits)
+        
         p_mask = torch.zeros(self.num_c, self.max_impls)
         active_pin_mask = torch.zeros(self.num_c * self.num_pins_per_c)
         

@@ -77,7 +77,7 @@ module domac_multiplier_top (
     // ==========================================
     // 2. DOMAC AI 优化压缩树 (CT)
     // ==========================================
-    wire out_pp_0, out_pp_1, out_pp_8, out_pp_16, out_pp_63, comp_0_S, comp_1_S, comp_2_S, comp_4_S, comp_5_S, comp_8_S, comp_9_S, comp_13_S, comp_14_S, comp_19_S, comp_20_S, comp_25_S, comp_26_S, comp_30_S, comp_31_S, comp_34_S, comp_35_S, comp_37_S, comp_38_S, comp_39_S, comp_40_S, comp_41_S, comp_39_CO, comp_41_CO;
+    wire out_pp_0, out_pp_1, out_pp_2, out_pp_8, out_pp_63, comp_0_S, comp_1_S, comp_2_S, comp_4_S, comp_5_S, comp_8_S, comp_9_S, comp_13_S, comp_14_S, comp_19_S, comp_20_S, comp_25_S, comp_26_S, comp_30_S, comp_31_S, comp_34_S, comp_35_S, comp_37_S, comp_38_S, comp_39_S, comp_40_S, comp_41_S, comp_40_CO, comp_41_CO;
 
     domac_compressor_tree U_CT (
         .pp_in_0(pp_in_0),
@@ -146,8 +146,8 @@ module domac_multiplier_top (
         .pp_in_63(pp_in_63),
         .out_pp_0(out_pp_0),
         .out_pp_1(out_pp_1),
+        .out_pp_2(out_pp_2),
         .out_pp_8(out_pp_8),
-        .out_pp_16(out_pp_16),
         .out_pp_63(out_pp_63),
         .comp_0_S(comp_0_S),
         .comp_1_S(comp_1_S),
@@ -171,7 +171,7 @@ module domac_multiplier_top (
         .comp_39_S(comp_39_S),
         .comp_40_S(comp_40_S),
         .comp_41_S(comp_41_S),
-        .comp_39_CO(comp_39_CO),
+        .comp_40_CO(comp_40_CO),
         .comp_41_CO(comp_41_CO)
     );
 
@@ -182,7 +182,7 @@ module domac_multiplier_top (
     wire [15:0] cpa_vec_0;
     assign cpa_vec_0[0] = out_pp_0;
     assign cpa_vec_0[1] = out_pp_1;
-    assign cpa_vec_0[2] = out_pp_16;
+    assign cpa_vec_0[2] = out_pp_2;
     assign cpa_vec_0[3] = comp_1_S;
     assign cpa_vec_0[4] = comp_4_S;
     assign cpa_vec_0[5] = comp_8_S;
@@ -211,7 +211,7 @@ module domac_multiplier_top (
     assign cpa_vec_1[10] = comp_35_S;
     assign cpa_vec_1[11] = comp_38_S;
     assign cpa_vec_1[12] = comp_40_S;
-    assign cpa_vec_1[13] = comp_39_CO;
+    assign cpa_vec_1[13] = comp_40_CO;
     assign cpa_vec_1[14] = comp_41_CO;
     assign cpa_vec_1[15] = 1'b0; // 缺位补零
 
