@@ -69,9 +69,15 @@ class DOMACTrainer:
             self.update_hyperparameters(epoch)
             self.optimizer.zero_grad()
             
+            # ================= [新增：极其暴力的温度退火] =================
+            # 指数级降温：Epoch 0 时 tau=1.0，Epoch 300 时 tau 接近 0.05
+            # 这会把 AI 伪造的 "冰块概率" 强行压成 0，暴露出真实的延迟！
+            current_tau = max(0.05, 1.0 * (0.985 ** epoch))
+            # current_tau = 1
             # ================= [探针 1: 前向传播 STA] =================
             t0 = time.time()
-            wns, tns, area, M, P_c = self.model(pp_at, pp_slew)
+            # wns, tns, area, M, P_c = self.model(pp_at, pp_slew)
+            wns, tns, area, M, P_c = self.model(pp_at, pp_slew, tau=current_tau)
             t1 = time.time()
             acc_forward += (t1 - t0)
             
@@ -112,7 +118,26 @@ class DOMACTrainer:
                       f"Backward: {acc_backward/div:.3f}s | "
                       f"Step: {acc_step/div:.3f}s")
                 
+                # ================= [探针：抓捕 AI 的概率稀释作弊] =================
+                # M 矩阵的 Shape 是 [总节点数, 压缩器引脚总数]
+                # 对每一列求最大值，代表该引脚最主要的信号来源所占的百分比
+                max_probs_per_pin, _ = torch.max(M, dim=0)
+                
+                # 统计有多少个引脚的“主来源概率”低于 0.95 (即掺杂了 >5% 的冰块信号)
+                cheating_pins = torch.sum((max_probs_per_pin < 0.95) & (active_pin_mask > 0.5)).item()
+                avg_max_prob = torch.mean(max_probs_per_pin).item()
+                
+                print(f"  -> [探针] 引脚最大连接概率均值: {avg_max_prob:.4f} (若趋近 1.0 则为纯粹硬连线)")
+                print(f"  -> [探针] 发现 {cheating_pins} 个引脚正在进行严重的小数概率稀释！")
+                
+                # 特别打印最后一个压缩器 (极有可能是贪吃蛇的末端) 的三个引脚连线概率
+                last_c_idx = P_c.shape[0] - 1
+                col_A = last_c_idx * 3 + 0
+                col_B = last_c_idx * 3 + 1
+                col_CI = last_c_idx * 3 + 2
+                print(f"  -> [探针] 末端加法器_{last_c_idx} 的主来源概率 - A:{max_probs_per_pin[col_A]:.4f}, B:{max_probs_per_pin[col_B]:.4f}, CI:{max_probs_per_pin[col_CI]:.4f}")
                 # 清零累加器，准备下一个周期的监控
+
                 acc_forward, acc_loss, acc_backward, acc_step = 0.0, 0.0, 0.0, 0.0
 
         print("[Optimizer] 训练收敛完成。")

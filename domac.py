@@ -112,12 +112,118 @@ def generate_multiplier_canvas(bit_width):
 
     return pp_cols, comp_cols, c_types
     
+def generate_dadda_init_matrix(bit_width, pp_cols, c_cols, c_types):
+    """
+    [Dr. Gemini 热启动引擎] 提取纯血 Dadda 树的硬连线逻辑，
+    并转化为 DOMAC 连续概率矩阵的初始 Logits。
+    """
+    print(f"\n[Warm Start] 正在提取 Dadda 拓扑作为先验知识，初始化拓扑概率矩阵...")
+    num_pp = len(pp_cols)
+    num_c = len(c_cols)
+    total_nodes = num_pp + 2 * num_c
+    total_target_pins = num_c * 3
+    
+    # 初始化全 0 矩阵 (Logits)。之后会被 Softmax 转化为概率。
+    m_logits = torch.zeros((total_nodes, total_target_pins + 1))
+    
+    max_cols = bit_width * 2 - 1
+    signals = [[] for _ in range(max_cols)]
+    
+    # 1. 初始化 PP 信号源节点 ID (0 到 num_pp-1)
+    k = 0
+    for i in range(bit_width):
+        for j in range(bit_width):
+            signals[i+j].append(k)
+            k += 1
+            
+    dadda_seq = [2]
+    while dadda_seq[-1] < bit_width:
+        dadda_seq.append(int(dadda_seq[-1] * 1.5))
+    dadda_seq.reverse()
+    targets = [t for t in dadda_seq if t < max([len(col) for col in signals])]
+    
+    # 2. 建立反向映射表：DOMAC 的压缩器是按列(col)排好序的，
+    # 我们必须把 Dadda 生成过程中的压缩器准确映射到 DOMAC 的绝对索引 j 上。
+    comp_index_map = {col: {'FA': [], 'HA': []} for col in range(max_cols)}
+    for j, (col, c_type) in enumerate(zip(c_cols, c_types)):
+        comp_index_map[col][c_type].append(j)
+        
+    comp_usage = {col: {'FA': 0, 'HA': 0} for col in range(max_cols)}
+    
+    # 3. 严格遵循 Dadda 算法，但这次我们记录连线索引！
+    for stage_idx, target in enumerate(targets):
+        next_signals = [[] for _ in range(max_cols + 1)]
+        carry_from_prev = []
+        
+        for col in range(len(signals)):
+            current_sigs = signals[col] + carry_from_prev
+            V = len(current_sigs)
+            
+            if V > target:
+                reduction_needed = V - target
+                f = reduction_needed // 2
+                h = reduction_needed % 2
+                
+                carries_generated = []
+                
+                for _ in range(f):
+                    s1, s2, s3 = current_sigs.pop(), current_sigs.pop(), current_sigs.pop()
+                    # 获取该 FA 在 DOMAC 体系下的绝对索引
+                    j = comp_index_map[col]['FA'][comp_usage[col]['FA']]
+                    comp_usage[col]['FA'] += 1
+                    
+                    # [注入先验偏置] 给 Dadda 的目标连线施加 10.0 的极高初始权重
+                    m_logits[s1, j * 3 + 0] = 10.0
+                    m_logits[s2, j * 3 + 1] = 10.0
+                    m_logits[s3, j * 3 + 2] = 10.0
+                    
+                    # 生成下一级的节点 ID
+                    next_signals[col].append(num_pp + j)       # S 输出
+                    carries_generated.append(num_pp + num_c + j) # CO 输出
+                    
+                for _ in range(h):
+                    s1, s2 = current_sigs.pop(), current_sigs.pop()
+                    j = comp_index_map[col]['HA'][comp_usage[col]['HA']]
+                    comp_usage[col]['HA'] += 1
+                    
+                    m_logits[s1, j * 3 + 0] = 10.0
+                    m_logits[s2, j * 3 + 1] = 10.0
+                    
+                    next_signals[col].append(num_pp + j)
+                    carries_generated.append(num_pp + num_c + j)
+                    
+                next_signals[col].extend(current_sigs)
+                carry_from_prev = carries_generated
+            else:
+                next_signals[col].extend(current_sigs)
+                carry_from_prev = []
+                
+        if carry_from_prev:
+            if len(signals) >= len(next_signals):
+                next_signals.append([])
+            next_signals[len(signals)].extend(carry_from_prev)
+            
+        signals = next_signals
+
+    # 4. 处理最终流向 CPA (Sink) 的剩余信号
+    for i in range(total_nodes):
+        # 如果某个节点没有任何一根引脚指向压缩器（最高 Logit 小于 5.0），说明它直接通向 Sink
+        if torch.max(m_logits[i, :-1]) < 5.0:
+            m_logits[i, -1] = 10.0
+            
+    print(f" -> Dadda 知识蒸馏完毕！已将 {int(torch.sum(m_logits == 10.0).item())} 根硬连线转化为高斯先验。")
+    return m_logits
 
 def main():
     print("="*60)
     print(" [DOMAC 净室复现] TSMC 28nm 节点可微 STA 优化框架")
     print("="*60)
     
+    # ================= [新增：全局优化策略配置] =================
+    # 'dadda' : 从 Dadda 树先验知识热启动 (100% 对齐对照组)
+    # 'blank' : 从等概率全零矩阵冷启动 (纯粹从零开始探索)
+    INIT_MODE = 'blank'
+
     TARGET_CELLS = [
         'FA1D0BWP12T40P140', 'FA1D1BWP12T40P140', 'FA1D2BWP12T40P140', 'FA1D4BWP12T40P140',
         'HA1D0BWP12T40P140', 'HA1D1BWP12T40P140', 'HA1D2BWP12T40P140', 'HA1D4BWP12T40P140'
@@ -170,7 +276,7 @@ def main():
         print(f"\n[Fatal Error] 系统初始化失败，拒绝以非严谨模式运行。原因: {e}")
         sys.exit(1)
         
-    BIT_WIDTH = 8
+    BIT_WIDTH = 6
     TARGET_SINK_COUNT = (BIT_WIDTH * 2 - 1) * 2
     PP_COLS, COMP_COLS, C_TYPES = generate_multiplier_canvas(BIT_WIDTH)
     NUM_PP = len(PP_COLS)
@@ -207,10 +313,49 @@ def main():
     print("REQ_TIME：" + str(REQ_TIME))
 
     print(f"\n[Engine] 构建异构可微压缩树...")
-    # 2. 传递 device 给模型，并强制模型所有 Parameter 和 Buffer 上 GPU
-    model = DOMAC_CompressorTree(PP_COLS, COMP_COLS, fa_tensors, ha_tensors, C_TYPES, REQ_TIME, device=device).to(device)
+    # ================= [核心重构：初始态路由引擎] =================
+    max_impls = max(len(fa_tensors), len(ha_tensors))
+    
+    # [修复1] 显式定义基准物理门索引 (1 代表使用 FA1D1)
+    BASELINE_GATE_INDEX = 1 
+    # 安全处理：如果库里只有一个尺寸，强制使用索引 0
+    safe_gate_idx = BASELINE_GATE_INDEX if max_impls > BASELINE_GATE_INDEX else 0
 
-    # loss_engine = DOMACLossFunction()
+    if INIT_MODE == 'dadda':
+        print(f" -> [Init] 采用 Dadda 树先验知识热启动 (物理门初始尺寸: D{safe_gate_idx})")
+        init_m = generate_dadda_init_matrix(BIT_WIDTH, PP_COLS, COMP_COLS, C_TYPES)
+        
+        init_p = torch.zeros((NUM_COMPRESSORS, max_impls))
+        init_p[:, safe_gate_idx] = 10.0  
+        
+        # 从初始矩阵萃取 100% 对齐的 Baseline
+        discrete_init_M = torch.zeros_like(init_m)
+        discrete_init_M[:, :-1] = (init_m[:, :-1] == 10.0).float() 
+        discrete_init_P = [safe_gate_idx] * NUM_COMPRESSORS
+
+    elif INIT_MODE == 'blank':
+        print(f" -> [Init] 采用等概率全零矩阵冷启动 (无先验知识)")
+        total_nodes = NUM_PP + 2 * NUM_COMPRESSORS
+        total_target_pins = NUM_COMPRESSORS * 3
+        init_m = torch.zeros((total_nodes, total_target_pins + 1))
+        init_p = torch.zeros((NUM_COMPRESSORS, max_impls))
+        
+        # 白板模式没有初始物理结构，无法生成 Baseline 网表
+        discrete_init_M = None
+        discrete_init_P = None
+        
+    else:
+        raise ValueError(f"[Fatal] 未知的初始化模式: {INIT_MODE}")
+        
+    # ============================================================
+    # 2. [修复2] 将 init_m 和 init_p 喂给模型，并上 GPU
+    model = DOMAC_CompressorTree(
+        PP_COLS, COMP_COLS, fa_tensors, ha_tensors, C_TYPES, REQ_TIME, 
+        device=device,
+        init_m_logits=init_m, 
+        init_p_logits=init_p
+    ).to(device)
+
     # 将动态约束传入 Loss 引擎
     loss_engine = DOMACLossFunction(target_sink_count=TARGET_SINK_COUNT)
     trainer = DOMACTrainer(model, loss_engine, lr=0.05)
@@ -222,47 +367,16 @@ def main():
     
     print("\n[System] 优化执行完毕！网表拓扑已坍缩至离散界限附近。")
     
-    # ================= [新增联调区块：全自动生成网表] =================
-    
     # 1. 启动合法化器 (离散坍缩)
     legalizer = DOMACLegalizer()
     discrete_M, discrete_P = legalizer.legalize(final_M, final_P, C_TYPES, model.dag_mask)
     
-    # # ================= [新增：Dr. Gemini 的矩阵透视镜] =================
-    # # 临时修改 PyTorch 的打印选项，防止矩阵被折叠省略，保留 4 位小数以便观察概率分布
-    # torch.set_printoptions(precision=4, sci_mode=False, linewidth=150, profile="full")
-    
-    # print("\n" + "="*60)
-    # print(" 🔍 [矩阵透视] 连续概率态 vs 物理离散态")
-    # print("="*60)
-    
-    # print(f"\n1. [连续概率态] 物理实现矩阵 P_c (Shape: {final_P.shape}):")
-    # print("   (行代表 6 台压缩器，列代表 8 种物理门选项的选中概率)")
-    # print(final_P)
-    
-    # print("\n2. [离散坍缩态] 最终选定的物理门索引 P_discrete:")
-    # print(f"   {discrete_P}")
-    
-    # print(f"\n3. [连续概率态] 互连拓扑矩阵 M_internal (Shape: {final_M.shape}):")
-    # print("   (行代表 28 个物理节点，列代表 18 个压缩器靶点引脚的连线概率)")
-    # print(final_M)
-    
-    # print(f"\n4. [离散坍缩态] 合法化后的纯 0/1 拓扑矩阵 discrete_M (Shape: {discrete_M.shape}):")
-    # print("   (这就是最终喂给 Verilog 的纯血 EDA 布线图)")
-    # print(discrete_M)
-    
-    # print("="*60 + "\n")
-    # # 恢复 PyTorch 默认打印截断（可选）
-    # torch.set_printoptions(profile="default")
-    # # ===================================================================
-
     # 2. 启动 Verilog 打印机
-    # 确保输出目录存在
     os.makedirs("output/netlists", exist_ok=True)
     
     v_gen = VerilogGenerator(
-        pp_cols=PP_COLS,       # <--- 新增传入参数
-        c_cols=COMP_COLS,      # <--- 新增传入参数
+        pp_cols=PP_COLS, 
+        c_cols=COMP_COLS,
         c_types=C_TYPES,
         fa_cell_names=fa_names,
         ha_cell_names=ha_names
@@ -273,7 +387,8 @@ def main():
     
     v_gen.generate(discrete_M, discrete_P, output_file=netlist_path)
     v_gen.generate_testbench(tb_file=tb_path, netlist_file=netlist_path)
-    # ================= [新增模块组装] =================
+    
+    # [修复3] 删除了重复的 generate_multiplier_top
     top_path = "output/netlists/domac.v"
     v_gen.generate_multiplier_top(
         bit_width=BIT_WIDTH, 
@@ -281,12 +396,30 @@ def main():
         ct_module_name="domac_compressor_tree", 
         top_module_name="domac"
     )
-    # ================= [新增：顺手生成纯血对照组网表] =================
-    v_gen.generate_pure_dadda_baseline(
-        bit_width=BIT_WIDTH,
-        output_file="output/netlists/dadda_baseline_ct.v",
-        top_file="output/netlists/dadda_baseline_top.v"
-    )
+
+    # ================= [替换：基于配置动态生成 Baseline] =================
+    if INIT_MODE == 'dadda' and discrete_init_M is not None:
+        print(f"\n[BaselineGen] 正在直接从 AI 热启动矩阵中剥离 {INIT_MODE} 基准网表 (保证 100% 对齐)...")
+        
+        # 1. 临时征用生成器，改名为 baseline
+        v_gen.module_name = f"{INIT_MODE}_baseline_ct"
+        
+        # 2. 将刚开局的 0/1 矩阵直接印成 RTL！
+        v_gen.generate(discrete_init_M, discrete_init_P, output_file=f"output/netlists/{INIT_MODE}_baseline_ct.v")
+        
+        # 3. 封装 Baseline 的顶层
+        v_gen.generate_multiplier_top(
+            bit_width=BIT_WIDTH,
+            top_file=f"output/netlists/{INIT_MODE}.v",
+            ct_module_name=f"{INIT_MODE}_baseline_ct",
+            top_module_name=f"{INIT_MODE}"
+        )
+        
+        # 4. 恢复原名，保持工程整洁
+        v_gen.module_name = "domac_compressor_tree"
+    else:
+        print(f"\n[BaselineGen] 当前为 '{INIT_MODE}' 冷启动模式，跳过生成基准对照组网表。")
+    # =================================================================
 
     end_time = time.time()
     print("="*60)

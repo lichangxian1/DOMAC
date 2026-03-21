@@ -5,7 +5,9 @@ from .diff_sta import smooth_max_lse, diff_bilinear_interp
 
 class DOMAC_CompressorTree(nn.Module):
     # 1. 在初始化参数中加入 device
-    def __init__(self, pp_cols, c_cols, fa_tensors, ha_tensors, c_types, req_time, device='cpu'):
+    # def __init__(self, pp_cols, c_cols, fa_tensors, ha_tensors, c_types, req_time, device='cpu'):
+    #     super(DOMAC_CompressorTree, self).__init__()
+    def __init__(self, pp_cols, c_cols, fa_tensors, ha_tensors, c_types, req_time, device='cpu', init_m_logits=None, init_p_logits=None):
         super(DOMAC_CompressorTree, self).__init__()
         self.device = device  # <--- [核心新增] 记住目标设备
         self.pp_cols = pp_cols
@@ -32,7 +34,11 @@ class DOMAC_CompressorTree(nn.Module):
         self.ha_areas, self.ha_caps, self.ha_arcs = self._parse_tensors(ha_tensors)
         
         # ... 后续的 p_logits, dag_mask 等代码保持不变 ...
-        self.p_logits = nn.Parameter(torch.zeros(self.num_c, self.max_impls))
+        # self.p_logits = nn.Parameter(torch.zeros(self.num_c, self.max_impls))
+        if init_p_logits is not None:
+            self.p_logits = nn.Parameter(init_p_logits.clone().to(device))
+        else:
+            self.p_logits = nn.Parameter(torch.zeros(self.num_c, self.max_impls, device=device))
         # # [暴力修正] 假设你的库排序是 D0, D1, D2, D4
         # # 我们给 D2 (索引 2) 和 D4 (索引 3) 强行加上初始偏置，让 AI 开局就站在巨人的肩膀上
         # init_logits = torch.zeros(self.num_c, self.max_impls)
@@ -57,9 +63,16 @@ class DOMAC_CompressorTree(nn.Module):
         self.register_buffer('p_mask', p_mask)
         self.register_buffer('active_pin_mask', active_pin_mask)
         
+        # total_target_pins = self.num_c * self.num_pins_per_c 
+        # self.m_logits = nn.Parameter(torch.zeros(total_nodes, total_target_pins + 1))
         total_target_pins = self.num_c * self.num_pins_per_c 
-        self.m_logits = nn.Parameter(torch.zeros(total_nodes, total_target_pins + 1))
-        
+        if init_m_logits is not None:
+            # 采用传入的热启动矩阵
+            self.m_logits = nn.Parameter(init_m_logits.clone().to(device))
+        else:
+            # 原本的白板初始化
+            self.m_logits = nn.Parameter(torch.zeros(total_nodes, total_target_pins + 1, device=device))
+            
         dag_mask = torch.full((total_nodes, total_target_pins + 1), float('-inf'))
         for i in range(total_nodes):
             for j in range(self.num_c):
@@ -161,11 +174,16 @@ class DOMAC_CompressorTree(nn.Module):
 
         return torch.tensor(areas, dtype=torch.float32, device=self.device), torch.tensor(caps, dtype=torch.float32, device=self.device), stacked_arcs
 
-    def forward(self, pp_at, pp_slew):
-        P_c = F.softmax(self.p_logits + self.p_mask, dim=-1) 
-        M_full = F.softmax(self.m_logits + self.dag_mask, dim=-1) 
-        M_internal = M_full[:, :-1] 
-        
+    # def forward(self, pp_at, pp_slew):
+    #     P_c = F.softmax(self.p_logits + self.p_mask, dim=-1) 
+    #     M_full = F.softmax(self.m_logits + self.dag_mask, dim=-1) 
+    #     M_internal = M_full[:, :-1] 
+    def forward(self, pp_at, pp_slew, tau=1.0):
+        # 【核心修改】将 logits 除以温度 tau，tau 越小，概率越向 0/1 极化！
+        P_c = F.softmax((self.p_logits + self.p_mask) / tau, dim=-1) 
+        M_full = F.softmax((self.m_logits + self.dag_mask) / tau, dim=-1) 
+        M_internal = M_full[:, :-1]
+            
         expected_area = 0.0
         expected_pin_caps_list = []
 
