@@ -30,7 +30,7 @@ class DOMACTrainer:
             't2': 0.1,       # TNS 辅助全局路径寻优
             'alpha': 1,    # 【封印】前期绝对不许管面积！
             'lambda1': 0.18,  # 连线合法性是必须的
-            'lambda2': 0.42,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+            'lambda2': 0.5,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
             'tau_k':0.985,
         }
 
@@ -80,7 +80,7 @@ class DOMACTrainer:
             # 指数级降温：Epoch 0 时 tau=1.0，Epoch 300 时 tau 接近 0.05
             # 这会把 AI 伪造的 "冰块概率" 强行压成 0，暴露出真实的延迟！
             current_tau_k = self.hyperparams.get('tau_k')
-            current_tau = max(0.2, 1.0 * (current_tau_k ** epoch))
+            current_tau = max(0.05, 1.0 * (current_tau_k ** epoch))
             # current_tau = 1
             # # ================= [修复：三段式科学退火调度] =================
             # if epoch < 60:
