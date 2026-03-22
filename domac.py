@@ -3,6 +3,7 @@ import sys
 import torch
 import time
 import subprocess
+import numpy as np
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -224,11 +225,16 @@ def main():
     # 'blank' : 从等概率全零矩阵冷启动 (纯粹从零开始探索)
     INIT_MODE = 'blank'
 
-    TARGET_CELLS = [
-        'FA1D0BWP12T40P140', 'FA1D1BWP12T40P140', 'FA1D2BWP12T40P140', 'FA1D4BWP12T40P140',
-        'HA1D0BWP12T40P140', 'HA1D1BWP12T40P140', 'HA1D2BWP12T40P140', 'HA1D4BWP12T40P140'
-    ]
+    # TARGET_CELLS = [
+    #     'FA1D0BWP12T40P140', 'FA1D1BWP12T40P140', 'FA1D2BWP12T40P140', 'FA1D4BWP12T40P140',
+    #     'HA1D0BWP12T40P140', 'HA1D1BWP12T40P140', 'HA1D2BWP12T40P140', 'HA1D4BWP12T40P140'
+    # ]
     
+    TARGET_CELLS = [
+        'FA1D1BWP12T40P140',
+        'HA1D1BWP12T40P140',
+    ]
+
     # 提前准备好物理名字，用于最终生成 Verilog
     fa_names = [c for c in TARGET_CELLS if c.startswith('FA')]
     ha_names = [c for c in TARGET_CELLS if c.startswith('HA')]
@@ -239,9 +245,36 @@ def main():
             print("[System] 发现 PDK 物理库，启动解析...")
             parser = NLDMParser(lib_path, TARGET_CELLS)
             nldm_db = parser.parse()
-            # ================= [新增：物理数据透明化打印] =================
+        #    # ================= [新增：物理数据透明化打印 (全景引脚解析版)] =================
+        #     print("\n" + "="*60)
+        #     print(" 📊 [物理数据核对] 提取的 Area 与 Delay (Worst-case) 全景概览")
+        #     print("="*60)
+        #     for cell in TARGET_CELLS:
+        #         if cell in nldm_db:
+        #             area = nldm_db[cell].get('cell_area', 'N/A')
+        #             print(f"[{cell}]")
+        #             print(f"  -> 面积 (Area): {area} μm²")
+                    
+        #             # 遍历所有的输出引脚 (S, CO)
+        #             for out_pin in ['S', 'CO']:
+        #                 if out_pin in nldm_db[cell]:
+        #                     # 遍历所有的输入引脚 (A, B, CI)
+        #                     for in_pin in ['A', 'B', 'CI']:
+        #                         if in_pin in nldm_db[cell][out_pin]:
+        #                             arc_data = nldm_db[cell][out_pin][in_pin]
+        #                             delay_lut = arc_data.get('delay_lut')
+                                    
+        #                             # 确保 LUT 存在且有数据
+        #                             if delay_lut is not None and hasattr(delay_lut, 'min'):
+        #                                 delay_min = delay_lut.min().item()
+        #                                 delay_max = delay_lut.max().item()
+        #                                 print(f"  -> {in_pin} -> {out_pin:<2} 延迟极限范围: {delay_min:.5f} ns ~ {delay_max:.5f} ns")
+        #             print("-" * 40)
+        #     print("="*60 + "\n")
+        #     # ===================================================================
+        # ================= [增强：物理数据透明化打印 (含电容验证)] =================
             print("\n" + "="*60)
-            print(" 📊 [物理数据核对] 提取的 Area 与 Delay (Worst-case) 概览")
+            print(" 📊 [物理数据核对] 提取的 Area, Cap 与 Delay 全景概览")
             print("="*60)
             for cell in TARGET_CELLS:
                 if cell in nldm_db:
@@ -249,17 +282,25 @@ def main():
                     print(f"[{cell}]")
                     print(f"  -> 面积 (Area): {area} μm²")
                     
-                    # 挑选一个最长路径的时序弧 (例如 A -> S) 打印其延迟信息
-                    if 'S' in nldm_db[cell] and 'A' in nldm_db[cell]['S']:
-                        delay_lut = nldm_db[cell]['S']['A']['delay_lut']
-                        # 兼容 PyTorch Tensor 和 NumPy Array 的打印
-                        if hasattr(delay_lut, 'min'):
-                            delay_min = delay_lut.min().item()
-                            delay_max = delay_lut.max().item()
-                            print(f"  -> A->S 延迟 LUT 尺寸: {delay_lut.shape}")
-                            print(f"  -> A->S 延迟极限范围: {delay_min:.5f} ns ~ {delay_max:.5f} ns")
+                    # --- [关键：输出引脚电容验证] ---
+                    if 'pin_cap' in nldm_db[cell]:
+                        print(f"  -> 引脚输入电容 (Input Capacitance):")
+                        for pin, cap in nldm_db[cell]['pin_cap'].items():
+                            # 28nm 下通常在 0.001 pF 左右
+                            print(f"     * {pin:<3} : {cap:.6f} pF") 
                     else:
-                        print("  -> [警告] 未提取到 A->S 的时序弧！")
+                        print(f"  -> [Warning] 未发现引脚电容数据！")
+                    # -------------------------------
+                    
+                    # 遍历所有的输出引脚 (S, CO) 打印延迟范围
+                    for out_pin in ['S', 'CO']:
+                        if out_pin in nldm_db[cell]:
+                            for in_pin in ['A', 'B', 'CI']:
+                                if in_pin in nldm_db[cell][out_pin]:
+                                    arc_data = nldm_db[cell][out_pin][in_pin]
+                                    delay_lut = arc_data.get('delay_lut')
+                                    if delay_lut is not None:
+                                        print(f"  -> {in_pin} -> {out_pin:<2} 延迟极限: {delay_lut.min().item():.5f} ~ {delay_lut.max().item():.5f} ns")
                     print("-" * 40)
             print("="*60 + "\n")
             # ===================================================================
@@ -276,7 +317,7 @@ def main():
         print(f"\n[Fatal Error] 系统初始化失败，拒绝以非严谨模式运行。原因: {e}")
         sys.exit(1)
         
-    BIT_WIDTH = 6
+    BIT_WIDTH = 8
     TARGET_SINK_COUNT = (BIT_WIDTH * 2 - 1) * 2
     PP_COLS, COMP_COLS, C_TYPES = generate_multiplier_canvas(BIT_WIDTH)
     NUM_PP = len(PP_COLS)
@@ -307,7 +348,8 @@ def main():
 
     # 1. 初始信号输入必须在显存上创建
     # pp_at = torch.linspace(0.0, 0.1, NUM_PP, device=device) 
-    pp_at = torch.zeros(NUM_PP, device=device) 
+    # pp_at = torch.zeros(NUM_PP, device=device) 
+    pp_at = torch.full((NUM_PP,), 0.1, device=device)
     pp_slew = torch.full((NUM_PP,), 0.02, device=device)
     REQ_TIME = 0 
     print("REQ_TIME：" + str(REQ_TIME))
@@ -334,10 +376,21 @@ def main():
         discrete_init_P = [safe_gate_idx] * NUM_COMPRESSORS
 
     elif INIT_MODE == 'blank':
-        print(f" -> [Init] 采用等概率全零矩阵冷启动 (无先验知识)")
+        # print(f" -> [Init] 采用等概率全零矩阵冷启动 (无先验知识)")
+        # total_nodes = NUM_PP + 2 * NUM_COMPRESSORS
+        # total_target_pins = NUM_COMPRESSORS * 3
+        # init_m = torch.zeros((total_nodes, total_target_pins + 1))
+        # init_p = torch.zeros((NUM_COMPRESSORS, max_impls))
+        
+        print(f" -> [Init] 采用纯随机高斯噪声冷启动 (打破拓扑对称性)")
         total_nodes = NUM_PP + 2 * NUM_COMPRESSORS
         total_target_pins = NUM_COMPRESSORS * 3
-        init_m = torch.zeros((total_nodes, total_target_pins + 1))
+        # 【致命修复】绝不能用 zeros！必须用正态分布噪声打破梯度对称性
+        FIXED_SEED = 42 
+        torch.manual_seed(FIXED_SEED)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(FIXED_SEED)
+        init_m = torch.randn((total_nodes, total_target_pins + 1)) * 0.5
         init_p = torch.zeros((NUM_COMPRESSORS, max_impls))
         
         # 白板模式没有初始物理结构，无法生成 Baseline 网表
@@ -371,6 +424,179 @@ def main():
     legalizer = DOMACLegalizer()
     discrete_M, discrete_P = legalizer.legalize(final_M, final_P, C_TYPES, model.dag_mask)
     
+    # # ================= [新增：列高溢出探针 (Column Height Probe)] =================
+    # from collections import Counter
+    # print("\n" + "="*60)
+    # print(" 🕵️ [DOMAC 探针] 最终输出到 CPA 的列高 (Column Height) 核查")
+    # print("="*60)
+
+    # # 1. 获取所有节点的列权重属性
+    # node_cols = model.node_cols
+
+    # # 2. 找出流向 Sink (下游 CPA) 的节点
+    # # 在 discrete_M 中，如果某一行全为 0，说明该节点没有连向任何内部压缩器引脚，必然流向了 Sink
+    # row_sums = torch.sum(discrete_M, dim=1)
+    # nodes_to_sink = torch.where(row_sums == 0)[0].tolist()
+
+    # # 3. 提取这些残余节点的列权重，并统计每一列的数量
+    # sink_weights = [node_cols[i] for i in nodes_to_sink]
+    # col_counts = Counter(sink_weights)
+    
+    # overflow_detected = False
+    # for col, count in sorted(col_counts.items()):
+    #     if count > 2:
+    #         # 超过 2 个信号，必然触发 DC 综合工具的多重 CPA 级联雪崩！
+    #         print(f" 🚨 [致命溢出] 第 {col:>2} 列: 残留了 {count} 个未压缩信号！")
+    #         overflow_detected = True
+    #     else:
+    #         print(f" ✅ [正常]     第 {col:>2} 列: 残留 {count} 个信号")
+
+    # if overflow_detected:
+    #     print("\n ⚠️ 结论：列压缩未彻底完成！")
+    #     print("    下游 DC 综合工具将被迫把多余的信号强行跨接 (如 intadd_1 -> intadd_0)，导致 0.4ns+ 的时序雪崩！")
+    # else:
+    #     print("\n 完美：所有列已严格压缩至 <= 2，完全符合进入单一高速 CPA 的条件。")
+    # print("="*60 + "\n")
+    # # ==============================================================================
+
+    # ================= [新增：离散化后硬连线物理评估 (Post-Legalization Eval)] =================
+    print("\n[Evaluator] 正在对坍缩后的 0/1 离散硬连线进行最终物理时序核算...")
+    with torch.no_grad():
+        # 1. 构造离散化物理尺寸的 One-Hot 张量
+        discrete_P_tensor = torch.zeros_like(final_P)
+        for i, idx in enumerate(discrete_P):
+            discrete_P_tensor[i, idx] = 1.0
+            
+        # 2. 构造包含 Sink (CPA) 列的完整离散连线矩阵
+        discrete_M_full = torch.zeros_like(model.m_logits)
+        discrete_M_full[:, :-1] = discrete_M
+        # 匈牙利算法没有分给压缩树的引脚，必定全部流向了最后的 CPA (Sink)
+        row_sums = torch.sum(discrete_M, dim=1)
+        discrete_M_full[row_sums == 0, -1] = 1.0
+
+        # 3. 备份原本训练结束时的模糊 logits
+        orig_m_logits = model.m_logits.clone()
+        orig_p_logits = model.p_logits.clone()
+
+        # 4. [核心技巧] 注入极端 Logits 强制网络走硬连线
+        # 将 1 映射为 10000.0，0 映射为 -10000.0，经过 Softmax 后就是绝对的 1.0 和 0.0
+        new_m_logits = torch.full_like(orig_m_logits, -1e4)
+        new_m_logits[discrete_M_full == 1.0] = 1e4
+        model.m_logits.copy_(new_m_logits)
+
+        new_p_logits = torch.full_like(orig_p_logits, -1e4)
+        new_p_logits[discrete_P_tensor == 1.0] = 1e4
+        model.p_logits.copy_(new_p_logits)
+
+        # 5. 执行一次纯净的前向传播与 Loss 计算
+        eval_wns, eval_tns, eval_area, eval_M, eval_P = model(pp_at, pp_slew, tau=1.0)
+        eval_loss, eval_dict = loss_engine(
+            eval_wns, eval_tns, eval_area, eval_M, eval_P, trainer.hyperparams, 
+            model.active_pin_mask, model.c_types
+        )
+
+        print(f" -> [坍缩后真实指标] WNS: {eval_dict['wns'].item():.4f} ns | "
+              f"Area: {eval_dict['area'].item():.4f} μm² | "
+              f"L_BM: {eval_dict['l_bm'].item():.4f} | "
+              f"Total Loss: {eval_loss.item():.4f}")
+        
+        # ================= [新增：WNS 计算过程溯源探针] =================
+        print("\n" + "="*60)
+        print(" 🧮 [DOMAC 探针] 离散化网表 WNS 内部计算逻辑核对")
+        print("="*60)
+        
+        # 1. 提取离散化评估后的全图所有节点的 AT (到达时间)
+        all_ats = model._probe_node_ats.detach().cpu().numpy()
+        req_time = REQ_TIME # 你设定的目标时间 (当前是 0.0)
+        
+        # 2. 计算每个节点的 Slack (容限)
+        # Slack = 要求到达时间 - 实际到达时间
+        slacks = req_time - all_ats
+        
+        # 3. 找出全图 Slack 最差的节点 (即 AT 最大的节点)
+        worst_idx = np.argmin(slacks)
+        worst_at = all_ats[worst_idx]
+        worst_slack = slacks[worst_idx]
+        
+        # 4. 翻译这个“罪魁祸首”节点的物理身份
+        num_pp = len(PP_COLS)
+        num_c = len(COMP_COLS)
+        if worst_idx < num_pp:
+            node_name = f"原始输入信号 PP_in_{worst_idx}"
+        elif worst_idx < num_pp + num_c:
+            c_idx = worst_idx - num_pp
+            node_name = f"压缩器 U_comp_{c_idx} 的 S (Sum) 输出引脚"
+        else:
+            c_idx = worst_idx - num_pp - num_c
+            node_name = f"压缩器 U_comp_{c_idx} 的 CO (Carry-Out) 输出引脚"
+            
+        print(f" -> 1. 设定的目标到达时间 (REQ_TIME) : {req_time:.4f} ns")
+        print(f" -> 2. 全局最慢的关键节点判定为     : {node_name}")
+        print(f" -> 3. 查表计算的该节点实际 AT      : {worst_at:.4f} ns")
+        print(f" -> 4. 原始负超额 (Negative Slack)  : {min(0.0, worst_slack):.4f} ns")
+        
+        # 因为 DOMAC 使用了 smooth_max_lse (Log-Sum-Exp) 来保证导数连续，
+        # 所以最终平滑出的 WNS 会比绝对最大值稍微大一点点 (gamma=0.01 产生的极小膨胀)
+        print(f" -> 5. AI 最终汇报的平滑 eval_wns   : {eval_wns.item():.4f} ns")
+        print(f"\n [对比 DC] 你的 DC 综合报告 Max Delay 为: 0.60 ns")
+        
+        if abs(worst_at - 0.60) < 0.08:
+            print(" ✅ 结论: AI 内部的物理计算与 DC 高度吻合！AI 并没有算错！")
+            print("    失败原因：优化器 (Optimizer) 梯度下降时，被困在了 S 引脚串联的死胡同里。")
+        else:
+            print(" ❌ 结论: AI 的延迟计算与 DC 存在较大脱节，需检查 LUT 插值。")
+        print("="*60 + "\n")
+        # ====================================================================
+
+        # 6. 恢复原本的 logits (保持代码状态安全)
+        model.m_logits.copy_(orig_m_logits)
+        model.p_logits.copy_(orig_p_logits)
+    # ================= [新增：离散化后硬连线物理评估 (Post-Legalization Eval)] =================
+
+# ================= [新增：波前到达时间 (Wavefront AT) 探针] =================
+    print("\n" + "="*65)
+    print(" 🌊 [DOMAC 探针] CPA 输入波前到达时间 (Wavefront AT) 剖析")
+    print("="*65)
+    
+    # 提取离散化评估后，全图节点的真实物理到达时间
+    node_ats = model._probe_node_ats.detach().cpu().numpy()
+    node_cols = model.node_cols
+    
+    # 找出流向 Sink 的节点 (行和为 0 的离散 M)
+    row_sums = torch.sum(discrete_M, dim=1)
+    nodes_to_sink = torch.where(row_sums == 0)[0].tolist()
+    
+    # 按照列(Column)分类收集这些节点的 AT
+    col_to_ats = {}
+    for idx in nodes_to_sink:
+        col = node_cols[idx]
+        at = node_ats[idx]
+        if col not in col_to_ats:
+            col_to_ats[col] = []
+        col_to_ats[col].append(at)
+        
+    print(f"{'比特位 (Column)':<15} | {'交付给 CPA 的最晚时间 (Max AT)':<25} | {'波前状态诊断'}")
+    print("-" * 65)
+    
+    for col in sorted(col_to_ats.keys()):
+        max_at = max(col_to_ats[col])
+        # 诊断逻辑：低位（如 0~6 列）如果不低于 0.18ns，说明严重挤占了 CPA 的进位跑道
+        if col < 7 and max_at > 0.18:
+            status = "🚨 危险 (波前倒置/低位滞后)"
+        elif col >= 7 and max_at > 0.28:
+            status = "⚠️ 偏高 (全局延迟瓶颈)"
+        else:
+            status = "✅ 优秀 (符合 CPA 期望)"
+            
+        print(f" Col {col:<10} | {max_at:.4f} ns{'':<16} | {status}")
+        
+    print("="*65 + "\n")
+    print(" 💡 【波前理论解读】：")
+    print(" 理想的压缩树输出，其 AT 应该呈现『阶梯上升』的斜坡形态 (LSB极早，MSB晚)。")
+    print(" 如果上表中，低位(Col 0~6) 的延迟达到了 0.20ns+，CPA 的进位计算将被迫")
+    print(" 拖延到此时才能起跑，导致最终 DC 综合的总体延迟发生雪崩！")
+    # ==============================================================================
+
     # 2. 启动 Verilog 打印机
     os.makedirs("output/netlists", exist_ok=True)
     

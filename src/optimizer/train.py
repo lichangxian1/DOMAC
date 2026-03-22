@@ -26,37 +26,41 @@ class DOMACTrainer:
         # }
 
         self.hyperparams = {
-            't1': 10.0,     # WNS 权重拉到极致，逼迫网络突破延迟极限
-            't2': 0.01,       # TNS 辅助全局路径寻优
-            'alpha': 0,    # 【封印】前期绝对不许管面积！
+            't1': 1.7,     # WNS 权重拉到极致，逼迫网络突破延迟极限
+            't2': 0.1,       # TNS 辅助全局路径寻优
+            'alpha': 1,    # 【封印】前期绝对不许管面积！
             'lambda1': 0.1,  # 连线合法性是必须的
-            'lambda2': 0,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+            'lambda2': 0.5,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+            'tau_k':0.975,
         }
-    # def update_hyperparameters(self, epoch):
-    #     if epoch >= 100:
-    #         self.hyperparams['alpha'] *= 1.003
-    #         self.hyperparams['t1'] *= 1.005
-    #         self.hyperparams['t2'] *= 1.005
-    #         self.hyperparams['lambda1'] *= 1.01
-    #         self.hyperparams['lambda2'] *= 1.01
-
     def update_hyperparameters(self, epoch):
-        """
-        动态退火调度器：分阶段释放约束
-        """
-        # 阶段 1 (Epoch 0-99)：野蛮生长，全力追求 WNS 和合法拓扑
+        if epoch >= 100:
+            self.hyperparams['alpha'] *= 1.003
+            self.hyperparams['t1'] *= 1.005
+            self.hyperparams['t2'] *= 1.005
+            self.hyperparams['lambda1'] *= 1.01
+            self.hyperparams['lambda2'] *= 1.01
+
+    # def update_hyperparameters(self, epoch):
+    #     """
+    #     动态退火调度器：分阶段释放约束
+    #     """
+    #     # 阶段 1 (Epoch 0-99)：野蛮生长，全力追求 WNS 和合法拓扑
         
-        # 阶段 2 (Epoch 100 触发)：拓扑基本成型，开始施加面积与二值化压力
-        if epoch == 100:
-            print("\n[Scheduler] Epoch 100 抵达！解封 Area 与 二值化 (L_D) 约束！")
-            self.hyperparams['alpha'] = 0.05   
-            self.hyperparams['lambda2'] = 0.1  
+    #     # 阶段 2 (Epoch 100 触发)：拓扑基本成型，开始施加面积与二值化压力
+    #     if epoch == 100:
+    #         print("\n[Scheduler] Epoch 100 抵达！解封 Area 与 二值化 (L_D) 约束！")
+    #         self.hyperparams['alpha'] = 0.05   
+    #         self.hyperparams['lambda2'] = 0.1  
             
-        # 阶段 3 (Epoch 100-300)：温水煮青蛙，逐步收紧离散化和合法性，逼迫最终坍缩
-        if epoch > 100:
-            self.hyperparams['lambda1'] *= 1.02  # 越来越严苛的合法性
-            self.hyperparams['lambda2'] *= 1.05  # 逼迫概率走向 0 或 1
-            self.hyperparams['alpha'] *= 1.005   # 轻微压缩面积
+    #     # 阶段 3 (Epoch 100-300)：温水煮青蛙，逐步收紧离散化和合法性，逼迫最终坍缩
+    #     if epoch > 120:
+    #         # self.hyperparams['lambda1'] *= 1.02  # 越来越严苛的合法性
+    #         # self.hyperparams['lambda2'] *= 1.05  # 逼迫概率走向 0 或 1
+    #         # self.hyperparams['alpha'] *= 1.005   # 轻微压缩面积
+    #         self.hyperparams['lambda1'] *= 1.02  
+    #         self.hyperparams['lambda2'] *= 1.05  
+    #         self.hyperparams['alpha'] *= 1.002
 
     def train(self, pp_at, pp_slew, max_epochs=300):
         print(f"[Optimizer] 启动 DOMAC 训练循环，最大迭代次数: {max_epochs}")
@@ -72,8 +76,26 @@ class DOMACTrainer:
             # ================= [新增：极其暴力的温度退火] =================
             # 指数级降温：Epoch 0 时 tau=1.0，Epoch 300 时 tau 接近 0.05
             # 这会把 AI 伪造的 "冰块概率" 强行压成 0，暴露出真实的延迟！
-            current_tau = max(0.05, 1.0 * (0.985 ** epoch))
+            current_tau_k = self.hyperparams.get('tau_k', 0.98)
+            current_tau = max(0.05, 1.0 * (current_tau_k ** epoch))
             # current_tau = 1
+            # # ================= [修复：三段式科学退火调度] =================
+            # if epoch < 60:
+            #     # [阶段 1: 探索期] 保持高温 1.0。
+            #     # 允许一定的概率稀释，让梯度在不同拓扑之间顺畅流动，寻找最优解
+            #     current_tau = 1.0 
+            # elif epoch < 200:
+            #     # [阶段 2: 极化期] 极其缓慢地降温。
+            #     # 0.99 保证在 140 个 Epoch 内从 1.0 慢慢降到 0.24 左右。
+            #     # 此时 WNS 的梯度依然存活，引导网络慢慢将优势路径向 1.0 靠拢。
+            #     current_tau = 1.0 * (0.99 ** (epoch - 60))
+            # else:
+            #     # [阶段 3: 淬火期] 强制逼近 0.1 以下，固化物理连线，准备迎接 Legalizer
+            #     # current_tau = max(0.05, 0.24 * (0.95 ** (epoch - 200)))
+            #     # [阶段 3: 淬火期] 强制极化，但保留最低限度的梯度流
+            #     current_tau = max(0.15, 0.24 * (0.95 ** (epoch - 200)))
+            # # =================================================================
+            
             # ================= [探针 1: 前向传播 STA] =================
             t0 = time.time()
             # wns, tns, area, M, P_c = self.model(pp_at, pp_slew)
@@ -103,7 +125,7 @@ class DOMACTrainer:
             acc_step += (t4 - t3)
             
             # 每 20 步打印一次物理指标与性能报告
-            if epoch % 20 == 0 or epoch == max_epochs - 1:
+            if epoch % 5 == 0 or epoch == max_epochs - 1:
                 print(f"\nEpoch {epoch:03d} | "
                       f"WNS: {loss_dict['wns'].item():.4f} | "
                       f"Area: {loss_dict['area'].item():.4f} | "
@@ -137,7 +159,33 @@ class DOMACTrainer:
                 col_CI = last_c_idx * 3 + 2
                 print(f"  -> [探针] 末端加法器_{last_c_idx} 的主来源概率 - A:{max_probs_per_pin[col_A]:.4f}, B:{max_probs_per_pin[col_B]:.4f}, CI:{max_probs_per_pin[col_CI]:.4f}")
                 # 清零累加器，准备下一个周期的监控
-
+                # ================= [深度时序探针：揭露 AT 概率稀释真相] =================
+                pin_ats = self.model._probe_pin_ats
+                node_ats = self.model._probe_node_ats
+                
+                # 找出全图预期到达时间 (Expected AT) 最大的输入引脚
+                worst_pin_idx = torch.argmax(pin_ats).item()
+                worst_expected_at = pin_ats[worst_pin_idx].item()
+                
+                print(f"\n  🔍 [时序深度穿透] 观测最差引脚 Index: {worst_pin_idx} | 连续域期望 AT: {worst_expected_at:.4f} ns")
+                
+                # 提取该引脚的上游连线概率云
+                probs_to_worst_pin = M[:, worst_pin_idx]
+                top_probs, top_indices = torch.topk(probs_to_worst_pin, 5)
+                
+                expected_at_sum = 0.0
+                for p, src_idx in zip(top_probs, top_indices):
+                    src_at = node_ats[src_idx].item()
+                    contribution = p.item() * src_at
+                    expected_at_sum += contribution
+                    print(f"      [源节点 {src_idx.item():>3d}] 概率: {p.item():.4f} | 真实物理AT: {src_at:.4f} ns -> 被稀释为: {contribution:.4f} ns")
+                
+                print(f"      ... (长尾碎概率贡献总和: {max(0.0, worst_expected_at - expected_at_sum):.4f} ns)")
+                
+                worst_physical_at = node_ats[top_indices[0]].item()
+                print(f"  ⚠️  [物理真相警告] 若此时 Legalizer 强行硬连最大概率线, 该引脚真实 AT 将瞬间暴涨至 -> {worst_physical_at:.4f} ns!\n")
+                # ====================================================================
+                
                 acc_forward, acc_loss, acc_backward, acc_step = 0.0, 0.0, 0.0, 0.0
 
         print("[Optimizer] 训练收敛完成。")

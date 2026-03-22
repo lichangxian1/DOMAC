@@ -39,14 +39,6 @@ class DOMAC_CompressorTree(nn.Module):
             self.p_logits = nn.Parameter(init_p_logits.clone().to(device))
         else:
             self.p_logits = nn.Parameter(torch.zeros(self.num_c, self.max_impls, device=device))
-        # # [暴力修正] 假设你的库排序是 D0, D1, D2, D4
-        # # 我们给 D2 (索引 2) 和 D4 (索引 3) 强行加上初始偏置，让 AI 开局就站在巨人的肩膀上
-        # init_logits = torch.zeros(self.num_c, self.max_impls)
-        # # 假设最大索引是 3 (对应 D4)
-        # if self.max_impls >= 4:
-        #     init_logits[:, 2] = 2.0  # 偏好 D2
-        #     init_logits[:, 3] = 40.0  # 极度偏好 D4
-        # self.p_logits = nn.Parameter(init_logits)
         
         p_mask = torch.zeros(self.num_c, self.max_impls)
         active_pin_mask = torch.zeros(self.num_c * self.num_pins_per_c)
@@ -199,7 +191,18 @@ class DOMAC_CompressorTree(nn.Module):
             expected_pin_caps_list.append(c_caps)
             
         flat_expected_pin_caps = torch.cat(expected_pin_caps_list)
-        loads = M_internal @ flat_expected_pin_caps 
+        # ================= [核心物理修复：引入线负载模型 WLM] =================
+        # 假设 TSMC 28nm 下，一根跨 Cell 互连线的平均寄生电容约为 0.003 pF (3 fF)
+        # 你可以根据实际库的情况微调这个值
+        WIRE_CAP_PER_NET = 0.000 
+        
+        # 原逻辑：loads = M_internal @ flat_expected_pin_caps
+        # 新逻辑：只要存在连线（M_internal），就必须附加上导线的寄生电容！
+        # loads = M_internal @ flat_expected_pin_caps + M_internal * WIRE_CAP_PER_NET
+        # 修改 src/core/compressor_tree.py 第 201 行左右
+        loads = M_internal @ (flat_expected_pin_caps + WIRE_CAP_PER_NET)
+        # ====================================================================
+        # loads = M_internal @ flat_expected_pin_caps 
         
         # =========================================================================
         # [Dr. Gemini 降维打击：Push 前向广播范式]
@@ -278,9 +281,43 @@ class DOMAC_CompressorTree(nn.Module):
         all_ats_tensor = torch.cat([pp_at, s_ats_t, co_ats_t])
         
         slacks = self.req_time - all_ats_tensor
+
+        # # =========================================================================
+        # # 🚀 [核弹级物理修复：可微 CPA 代理模型 (Differentiable CPA Proxy)]
+        # # =========================================================================
+        # # 1. 计算每个节点流向外部 CPA (Sink) 的连续概率
+        # sink_probs = 1.0 - torch.sum(M_internal, dim=1)
+        # sink_probs = torch.clamp(sink_probs, min=0.0, max=1.0)
+        
+        # # 2. 假设 28nm 工艺下，CPA 内部每经过 1 bit 的进位延迟约为 0.035 ns
+        # # 你可以根据实际库的 FA CI->CO 延迟微调这个值
+        # CPA_CARRY_DELAY_PER_BIT = 0.035 
+        # max_col = max(self.node_cols)
+        
+        # # 3. 构造与所有节点对应的列权重张量，并送入 GPU
+        # cols_tensor = torch.tensor(self.node_cols, dtype=torch.float32, device=all_ats_tensor.device)
+        
+        # # 4. 计算每个节点的 CPA 进位惩罚：
+        # # 如果你处于第 c 列，且流向了 Sink，那么你必须为后续的 (max_col - c) 个进位链买单！
+        # distance_to_msb = max_col - cols_tensor
+        # cpa_penalty = distance_to_msb * CPA_CARRY_DELAY_PER_BIT * sink_probs
+        
+        # # 5. [核心] 带有 CPA 视野的全局有效到达时间
+        # effective_ats_tensor = all_ats_tensor + cpa_penalty
+        
+        # # 使用引入了 CPA 惩罚的 AT 来计算 Slack
+        # slacks = self.req_time - effective_ats_tensor
+        # # =========================================================================
+
         negative_slacks = torch.clamp(slacks, max=0.0)
         
         WNS = smooth_max_lse(-negative_slacks, gamma=0.01) 
         TNS = torch.sum(-negative_slacks)
         
+        # ================= [新增：探针埋点] =================
+        # 将当前周期的引脚期望AT和节点真实AT暂存，供训练探针解剖
+        self._probe_pin_ats = pin_ats_all.detach()
+        self._probe_node_ats = all_ats_tensor.detach()
+        # ====================================================
+
         return WNS, TNS, expected_area, M_internal, P_c

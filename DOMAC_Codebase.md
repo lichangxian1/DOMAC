@@ -229,13 +229,18 @@ def main():
     # ================= [新增：全局优化策略配置] =================
     # 'dadda' : 从 Dadda 树先验知识热启动 (100% 对齐对照组)
     # 'blank' : 从等概率全零矩阵冷启动 (纯粹从零开始探索)
-    INIT_MODE = 'blank'
+    INIT_MODE = 'dadda'
 
-    TARGET_CELLS = [
-        'FA1D0BWP12T40P140', 'FA1D1BWP12T40P140', 'FA1D2BWP12T40P140', 'FA1D4BWP12T40P140',
-        'HA1D0BWP12T40P140', 'HA1D1BWP12T40P140', 'HA1D2BWP12T40P140', 'HA1D4BWP12T40P140'
-    ]
+    # TARGET_CELLS = [
+    #     'FA1D0BWP12T40P140', 'FA1D1BWP12T40P140', 'FA1D2BWP12T40P140', 'FA1D4BWP12T40P140',
+    #     'HA1D0BWP12T40P140', 'HA1D1BWP12T40P140', 'HA1D2BWP12T40P140', 'HA1D4BWP12T40P140'
+    # ]
     
+    TARGET_CELLS = [
+        'FA1D1BWP12T40P140',
+        'HA1D1BWP12T40P140',
+    ]
+
     # 提前准备好物理名字，用于最终生成 Verilog
     fa_names = [c for c in TARGET_CELLS if c.startswith('FA')]
     ha_names = [c for c in TARGET_CELLS if c.startswith('HA')]
@@ -246,9 +251,36 @@ def main():
             print("[System] 发现 PDK 物理库，启动解析...")
             parser = NLDMParser(lib_path, TARGET_CELLS)
             nldm_db = parser.parse()
-            # ================= [新增：物理数据透明化打印] =================
+        #    # ================= [新增：物理数据透明化打印 (全景引脚解析版)] =================
+        #     print("\n" + "="*60)
+        #     print(" 📊 [物理数据核对] 提取的 Area 与 Delay (Worst-case) 全景概览")
+        #     print("="*60)
+        #     for cell in TARGET_CELLS:
+        #         if cell in nldm_db:
+        #             area = nldm_db[cell].get('cell_area', 'N/A')
+        #             print(f"[{cell}]")
+        #             print(f"  -> 面积 (Area): {area} μm²")
+                    
+        #             # 遍历所有的输出引脚 (S, CO)
+        #             for out_pin in ['S', 'CO']:
+        #                 if out_pin in nldm_db[cell]:
+        #                     # 遍历所有的输入引脚 (A, B, CI)
+        #                     for in_pin in ['A', 'B', 'CI']:
+        #                         if in_pin in nldm_db[cell][out_pin]:
+        #                             arc_data = nldm_db[cell][out_pin][in_pin]
+        #                             delay_lut = arc_data.get('delay_lut')
+                                    
+        #                             # 确保 LUT 存在且有数据
+        #                             if delay_lut is not None and hasattr(delay_lut, 'min'):
+        #                                 delay_min = delay_lut.min().item()
+        #                                 delay_max = delay_lut.max().item()
+        #                                 print(f"  -> {in_pin} -> {out_pin:<2} 延迟极限范围: {delay_min:.5f} ns ~ {delay_max:.5f} ns")
+        #             print("-" * 40)
+        #     print("="*60 + "\n")
+        #     # ===================================================================
+        # ================= [增强：物理数据透明化打印 (含电容验证)] =================
             print("\n" + "="*60)
-            print(" 📊 [物理数据核对] 提取的 Area 与 Delay (Worst-case) 概览")
+            print(" 📊 [物理数据核对] 提取的 Area, Cap 与 Delay 全景概览")
             print("="*60)
             for cell in TARGET_CELLS:
                 if cell in nldm_db:
@@ -256,17 +288,25 @@ def main():
                     print(f"[{cell}]")
                     print(f"  -> 面积 (Area): {area} μm²")
                     
-                    # 挑选一个最长路径的时序弧 (例如 A -> S) 打印其延迟信息
-                    if 'S' in nldm_db[cell] and 'A' in nldm_db[cell]['S']:
-                        delay_lut = nldm_db[cell]['S']['A']['delay_lut']
-                        # 兼容 PyTorch Tensor 和 NumPy Array 的打印
-                        if hasattr(delay_lut, 'min'):
-                            delay_min = delay_lut.min().item()
-                            delay_max = delay_lut.max().item()
-                            print(f"  -> A->S 延迟 LUT 尺寸: {delay_lut.shape}")
-                            print(f"  -> A->S 延迟极限范围: {delay_min:.5f} ns ~ {delay_max:.5f} ns")
+                    # --- [关键：输出引脚电容验证] ---
+                    if 'pin_cap' in nldm_db[cell]:
+                        print(f"  -> 引脚输入电容 (Input Capacitance):")
+                        for pin, cap in nldm_db[cell]['pin_cap'].items():
+                            # 28nm 下通常在 0.001 pF 左右
+                            print(f"     * {pin:<3} : {cap:.6f} pF") 
                     else:
-                        print("  -> [警告] 未提取到 A->S 的时序弧！")
+                        print(f"  -> [Warning] 未发现引脚电容数据！")
+                    # -------------------------------
+                    
+                    # 遍历所有的输出引脚 (S, CO) 打印延迟范围
+                    for out_pin in ['S', 'CO']:
+                        if out_pin in nldm_db[cell]:
+                            for in_pin in ['A', 'B', 'CI']:
+                                if in_pin in nldm_db[cell][out_pin]:
+                                    arc_data = nldm_db[cell][out_pin][in_pin]
+                                    delay_lut = arc_data.get('delay_lut')
+                                    if delay_lut is not None:
+                                        print(f"  -> {in_pin} -> {out_pin:<2} 延迟极限: {delay_lut.min().item():.5f} ~ {delay_lut.max().item():.5f} ns")
                     print("-" * 40)
             print("="*60 + "\n")
             # ===================================================================
@@ -283,7 +323,7 @@ def main():
         print(f"\n[Fatal Error] 系统初始化失败，拒绝以非严谨模式运行。原因: {e}")
         sys.exit(1)
         
-    BIT_WIDTH = 6
+    BIT_WIDTH = 8
     TARGET_SINK_COUNT = (BIT_WIDTH * 2 - 1) * 2
     PP_COLS, COMP_COLS, C_TYPES = generate_multiplier_canvas(BIT_WIDTH)
     NUM_PP = len(PP_COLS)
@@ -341,10 +381,17 @@ def main():
         discrete_init_P = [safe_gate_idx] * NUM_COMPRESSORS
 
     elif INIT_MODE == 'blank':
-        print(f" -> [Init] 采用等概率全零矩阵冷启动 (无先验知识)")
+        # print(f" -> [Init] 采用等概率全零矩阵冷启动 (无先验知识)")
+        # total_nodes = NUM_PP + 2 * NUM_COMPRESSORS
+        # total_target_pins = NUM_COMPRESSORS * 3
+        # init_m = torch.zeros((total_nodes, total_target_pins + 1))
+        # init_p = torch.zeros((NUM_COMPRESSORS, max_impls))
+        
+        print(f" -> [Init] 采用纯随机高斯噪声冷启动 (打破拓扑对称性)")
         total_nodes = NUM_PP + 2 * NUM_COMPRESSORS
         total_target_pins = NUM_COMPRESSORS * 3
-        init_m = torch.zeros((total_nodes, total_target_pins + 1))
+        # 【致命修复】绝不能用 zeros！必须用正态分布噪声打破梯度对称性
+        init_m = torch.randn((total_nodes, total_target_pins + 1)) * 0.5
         init_p = torch.zeros((NUM_COMPRESSORS, max_impls))
         
         # 白板模式没有初始物理结构，无法生成 Baseline 网表
@@ -378,6 +425,52 @@ def main():
     legalizer = DOMACLegalizer()
     discrete_M, discrete_P = legalizer.legalize(final_M, final_P, C_TYPES, model.dag_mask)
     
+    # ================= [新增：离散化后硬连线物理评估 (Post-Legalization Eval)] =================
+    print("\n[Evaluator] 正在对坍缩后的 0/1 离散硬连线进行最终物理时序核算...")
+    with torch.no_grad():
+        # 1. 构造离散化物理尺寸的 One-Hot 张量
+        discrete_P_tensor = torch.zeros_like(final_P)
+        for i, idx in enumerate(discrete_P):
+            discrete_P_tensor[i, idx] = 1.0
+            
+        # 2. 构造包含 Sink (CPA) 列的完整离散连线矩阵
+        discrete_M_full = torch.zeros_like(model.m_logits)
+        discrete_M_full[:, :-1] = discrete_M
+        # 匈牙利算法没有分给压缩树的引脚，必定全部流向了最后的 CPA (Sink)
+        row_sums = torch.sum(discrete_M, dim=1)
+        discrete_M_full[row_sums == 0, -1] = 1.0
+
+        # 3. 备份原本训练结束时的模糊 logits
+        orig_m_logits = model.m_logits.clone()
+        orig_p_logits = model.p_logits.clone()
+
+        # 4. [核心技巧] 注入极端 Logits 强制网络走硬连线
+        # 将 1 映射为 10000.0，0 映射为 -10000.0，经过 Softmax 后就是绝对的 1.0 和 0.0
+        new_m_logits = torch.full_like(orig_m_logits, -1e4)
+        new_m_logits[discrete_M_full == 1.0] = 1e4
+        model.m_logits.copy_(new_m_logits)
+
+        new_p_logits = torch.full_like(orig_p_logits, -1e4)
+        new_p_logits[discrete_P_tensor == 1.0] = 1e4
+        model.p_logits.copy_(new_p_logits)
+
+        # 5. 执行一次纯净的前向传播与 Loss 计算
+        eval_wns, eval_tns, eval_area, eval_M, eval_P = model(pp_at, pp_slew, tau=1.0)
+        eval_loss, eval_dict = loss_engine(
+            eval_wns, eval_tns, eval_area, eval_M, eval_P, trainer.hyperparams, 
+            model.active_pin_mask, model.c_types
+        )
+
+        print(f" -> [坍缩后真实指标] WNS: {eval_dict['wns'].item():.4f} ns | "
+              f"Area: {eval_dict['area'].item():.4f} μm² | "
+              f"L_BM: {eval_dict['l_bm'].item():.4f} | "
+              f"Total Loss: {eval_loss.item():.4f}")
+        
+        # 6. 恢复原本的 logits (保持代码状态安全)
+        model.m_logits.copy_(orig_m_logits)
+        model.p_logits.copy_(orig_p_logits)
+    # ================= [新增：离散化后硬连线物理评估 (Post-Legalization Eval)] =================
+
     # 2. 启动 Verilog 打印机
     os.makedirs("output/netlists", exist_ok=True)
     
@@ -699,37 +792,41 @@ class DOMACTrainer:
         # }
 
         self.hyperparams = {
-            't1': 10.0,     # WNS 权重拉到极致，逼迫网络突破延迟极限
-            't2': 0.01,       # TNS 辅助全局路径寻优
-            'alpha': 0,    # 【封印】前期绝对不许管面积！
+            't1': 1,     # WNS 权重拉到极致，逼迫网络突破延迟极限
+            't2': 0.1,       # TNS 辅助全局路径寻优
+            'alpha': 1,    # 【封印】前期绝对不许管面积！
             'lambda1': 0.1,  # 连线合法性是必须的
-            'lambda2': 0,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+            'lambda2': 0.5,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+            'tau_k':0.975,
         }
-    # def update_hyperparameters(self, epoch):
-    #     if epoch >= 100:
-    #         self.hyperparams['alpha'] *= 1.003
-    #         self.hyperparams['t1'] *= 1.005
-    #         self.hyperparams['t2'] *= 1.005
-    #         self.hyperparams['lambda1'] *= 1.01
-    #         self.hyperparams['lambda2'] *= 1.01
-
     def update_hyperparameters(self, epoch):
-        """
-        动态退火调度器：分阶段释放约束
-        """
-        # 阶段 1 (Epoch 0-99)：野蛮生长，全力追求 WNS 和合法拓扑
+        if epoch >= 100:
+            self.hyperparams['alpha'] *= 1.003
+            self.hyperparams['t1'] *= 1.005
+            self.hyperparams['t2'] *= 1.005
+            self.hyperparams['lambda1'] *= 1.01
+            self.hyperparams['lambda2'] *= 1.01
+
+    # def update_hyperparameters(self, epoch):
+    #     """
+    #     动态退火调度器：分阶段释放约束
+    #     """
+    #     # 阶段 1 (Epoch 0-99)：野蛮生长，全力追求 WNS 和合法拓扑
         
-        # 阶段 2 (Epoch 100 触发)：拓扑基本成型，开始施加面积与二值化压力
-        if epoch == 100:
-            print("\n[Scheduler] Epoch 100 抵达！解封 Area 与 二值化 (L_D) 约束！")
-            self.hyperparams['alpha'] = 0.05   
-            self.hyperparams['lambda2'] = 0.1  
+    #     # 阶段 2 (Epoch 100 触发)：拓扑基本成型，开始施加面积与二值化压力
+    #     if epoch == 100:
+    #         print("\n[Scheduler] Epoch 100 抵达！解封 Area 与 二值化 (L_D) 约束！")
+    #         self.hyperparams['alpha'] = 0.05   
+    #         self.hyperparams['lambda2'] = 0.1  
             
-        # 阶段 3 (Epoch 100-300)：温水煮青蛙，逐步收紧离散化和合法性，逼迫最终坍缩
-        if epoch > 100:
-            self.hyperparams['lambda1'] *= 1.02  # 越来越严苛的合法性
-            self.hyperparams['lambda2'] *= 1.05  # 逼迫概率走向 0 或 1
-            self.hyperparams['alpha'] *= 1.005   # 轻微压缩面积
+    #     # 阶段 3 (Epoch 100-300)：温水煮青蛙，逐步收紧离散化和合法性，逼迫最终坍缩
+    #     if epoch > 120:
+    #         # self.hyperparams['lambda1'] *= 1.02  # 越来越严苛的合法性
+    #         # self.hyperparams['lambda2'] *= 1.05  # 逼迫概率走向 0 或 1
+    #         # self.hyperparams['alpha'] *= 1.005   # 轻微压缩面积
+    #         self.hyperparams['lambda1'] *= 1.02  
+    #         self.hyperparams['lambda2'] *= 1.05  
+    #         self.hyperparams['alpha'] *= 1.002
 
     def train(self, pp_at, pp_slew, max_epochs=300):
         print(f"[Optimizer] 启动 DOMAC 训练循环，最大迭代次数: {max_epochs}")
@@ -745,9 +842,26 @@ class DOMACTrainer:
             # ================= [新增：极其暴力的温度退火] =================
             # 指数级降温：Epoch 0 时 tau=1.0，Epoch 300 时 tau 接近 0.05
             # 这会把 AI 伪造的 "冰块概率" 强行压成 0，暴露出真实的延迟！
-            current_tau = max(0.05, 1.0 * (0.985 ** epoch))
-            wns, tns, area, M, P_c = self.model(pp_at, pp_slew, tau=current_tau)
-
+            current_tau_k = self.hyperparams.get('tau_k', 0.98)
+            current_tau = max(0.05, 1.0 * (current_tau_k ** epoch))
+            # current_tau = 1
+            # # ================= [修复：三段式科学退火调度] =================
+            # if epoch < 60:
+            #     # [阶段 1: 探索期] 保持高温 1.0。
+            #     # 允许一定的概率稀释，让梯度在不同拓扑之间顺畅流动，寻找最优解
+            #     current_tau = 1.0 
+            # elif epoch < 200:
+            #     # [阶段 2: 极化期] 极其缓慢地降温。
+            #     # 0.99 保证在 140 个 Epoch 内从 1.0 慢慢降到 0.24 左右。
+            #     # 此时 WNS 的梯度依然存活，引导网络慢慢将优势路径向 1.0 靠拢。
+            #     current_tau = 1.0 * (0.99 ** (epoch - 60))
+            # else:
+            #     # [阶段 3: 淬火期] 强制逼近 0.1 以下，固化物理连线，准备迎接 Legalizer
+            #     # current_tau = max(0.05, 0.24 * (0.95 ** (epoch - 200)))
+            #     # [阶段 3: 淬火期] 强制极化，但保留最低限度的梯度流
+            #     current_tau = max(0.15, 0.24 * (0.95 ** (epoch - 200)))
+            # # =================================================================
+            
             # ================= [探针 1: 前向传播 STA] =================
             t0 = time.time()
             # wns, tns, area, M, P_c = self.model(pp_at, pp_slew)
@@ -811,7 +925,33 @@ class DOMACTrainer:
                 col_CI = last_c_idx * 3 + 2
                 print(f"  -> [探针] 末端加法器_{last_c_idx} 的主来源概率 - A:{max_probs_per_pin[col_A]:.4f}, B:{max_probs_per_pin[col_B]:.4f}, CI:{max_probs_per_pin[col_CI]:.4f}")
                 # 清零累加器，准备下一个周期的监控
-
+                # ================= [深度时序探针：揭露 AT 概率稀释真相] =================
+                pin_ats = self.model._probe_pin_ats
+                node_ats = self.model._probe_node_ats
+                
+                # 找出全图预期到达时间 (Expected AT) 最大的输入引脚
+                worst_pin_idx = torch.argmax(pin_ats).item()
+                worst_expected_at = pin_ats[worst_pin_idx].item()
+                
+                print(f"\n  🔍 [时序深度穿透] 观测最差引脚 Index: {worst_pin_idx} | 连续域期望 AT: {worst_expected_at:.4f} ns")
+                
+                # 提取该引脚的上游连线概率云
+                probs_to_worst_pin = M[:, worst_pin_idx]
+                top_probs, top_indices = torch.topk(probs_to_worst_pin, 5)
+                
+                expected_at_sum = 0.0
+                for p, src_idx in zip(top_probs, top_indices):
+                    src_at = node_ats[src_idx].item()
+                    contribution = p.item() * src_at
+                    expected_at_sum += contribution
+                    print(f"      [源节点 {src_idx.item():>3d}] 概率: {p.item():.4f} | 真实物理AT: {src_at:.4f} ns -> 被稀释为: {contribution:.4f} ns")
+                
+                print(f"      ... (长尾碎概率贡献总和: {max(0.0, worst_expected_at - expected_at_sum):.4f} ns)")
+                
+                worst_physical_at = node_ats[top_indices[0]].item()
+                print(f"  ⚠️  [物理真相警告] 若此时 Legalizer 强行硬连最大概率线, 该引脚真实 AT 将瞬间暴涨至 -> {worst_physical_at:.4f} ns!\n")
+                # ====================================================================
+                
                 acc_forward, acc_loss, acc_backward, acc_step = 0.0, 0.0, 0.0, 0.0
 
         print("[Optimizer] 训练收敛完成。")
@@ -949,14 +1089,6 @@ class DOMAC_CompressorTree(nn.Module):
             self.p_logits = nn.Parameter(init_p_logits.clone().to(device))
         else:
             self.p_logits = nn.Parameter(torch.zeros(self.num_c, self.max_impls, device=device))
-        # # [暴力修正] 假设你的库排序是 D0, D1, D2, D4
-        # # 我们给 D2 (索引 2) 和 D4 (索引 3) 强行加上初始偏置，让 AI 开局就站在巨人的肩膀上
-        # init_logits = torch.zeros(self.num_c, self.max_impls)
-        # # 假设最大索引是 3 (对应 D4)
-        # if self.max_impls >= 4:
-        #     init_logits[:, 2] = 2.0  # 偏好 D2
-        #     init_logits[:, 3] = 40.0  # 极度偏好 D4
-        # self.p_logits = nn.Parameter(init_logits)
         
         p_mask = torch.zeros(self.num_c, self.max_impls)
         active_pin_mask = torch.zeros(self.num_c * self.num_pins_per_c)
@@ -1109,7 +1241,18 @@ class DOMAC_CompressorTree(nn.Module):
             expected_pin_caps_list.append(c_caps)
             
         flat_expected_pin_caps = torch.cat(expected_pin_caps_list)
-        loads = M_internal @ flat_expected_pin_caps 
+        # ================= [核心物理修复：引入线负载模型 WLM] =================
+        # 假设 TSMC 28nm 下，一根跨 Cell 互连线的平均寄生电容约为 0.003 pF (3 fF)
+        # 你可以根据实际库的情况微调这个值
+        WIRE_CAP_PER_NET = 0.000 
+        
+        # 原逻辑：loads = M_internal @ flat_expected_pin_caps
+        # 新逻辑：只要存在连线（M_internal），就必须附加上导线的寄生电容！
+        # loads = M_internal @ flat_expected_pin_caps + M_internal * WIRE_CAP_PER_NET
+        # 修改 src/core/compressor_tree.py 第 201 行左右
+        loads = M_internal @ (flat_expected_pin_caps + WIRE_CAP_PER_NET)
+        # ====================================================================
+        # loads = M_internal @ flat_expected_pin_caps 
         
         # =========================================================================
         # [Dr. Gemini 降维打击：Push 前向广播范式]
@@ -1193,6 +1336,12 @@ class DOMAC_CompressorTree(nn.Module):
         WNS = smooth_max_lse(-negative_slacks, gamma=0.01) 
         TNS = torch.sum(-negative_slacks)
         
+        # ================= [新增：探针埋点] =================
+        # 将当前周期的引脚期望AT和节点真实AT暂存，供训练探针解剖
+        self._probe_pin_ats = pin_ats_all.detach()
+        self._probe_node_ats = all_ats_tensor.detach()
+        # ====================================================
+
         return WNS, TNS, expected_area, M_internal, P_c
 ```
 
@@ -1386,424 +1535,5 @@ def diff_bilinear_interp(slew, load, index_1_slew, index_2_load, lut_values):
     val1 = v10 * (1 - wy) + v11 * wy
     
     return val0 * (1 - wx) + val1 * wx
-```
-
-### `src/export/verilog_gen.py`
-
-```python
-import torch
-
-class VerilogGenerator:
-    def __init__(self, pp_cols, c_cols, c_types, fa_cell_names, ha_cell_names, module_name="domac_compressor_tree"):
-        """
-        [Dr. Gemini 终极版] RTL 网表与 Testbench 双生生成器
-        """
-        self.pp_cols = pp_cols
-        self.c_cols = c_cols
-        self.num_pp = len(pp_cols)
-        self.num_c = len(c_cols)
-        self.c_types = c_types
-        self.module_name = module_name
-        self.fa_cell_names = fa_cell_names
-        self.ha_cell_names = ha_cell_names
-        
-        # 缓存输出端口的权重信息，供 TB 使用
-        self.tb_output_ports = [] 
-
-    def generate(self, discrete_M, discrete_P, output_file="output_netlist.v"):
-        print(f"\n[VerilogGen] 正在将矩阵拓扑编译为纯血 RTL 网表: {output_file}")
-        
-        total_nodes = self.num_pp + 2 * self.num_c
-        
-        wire_names = [f"pp_in_{i}" for i in range(self.num_pp)]
-        wire_names += [f"comp_{j}_S" for j in range(self.num_c)]
-        wire_names += [f"comp_{j}_CO" for j in range(self.num_c)]
-            
-        with open(output_file, 'w') as f:
-            f.write(f"module {self.module_name} (\n")
-            f.write(f"    input wire {', '.join(wire_names[:self.num_pp])}")
-            
-            output_ports = []
-            assign_statements = []
-            self.tb_output_ports = [] # 清空缓存
-            
-            row_sums = torch.sum(discrete_M, dim=1).tolist()
-            
-            for i in range(total_nodes):
-                if row_sums[i] == 0: 
-                    if i < self.num_pp:
-                        out_name = f"out_pp_{i}"
-                        output_ports.append(out_name)
-                        assign_statements.append(f"    assign {out_name} = {wire_names[i]};")
-                        self.tb_output_ports.append((out_name, self.pp_cols[i])) # 记录直通 PP 的权重
-                    else:
-                        out_name = wire_names[i]
-                        output_ports.append(out_name)
-                        
-                        # 解析是 S 还是 CO，并记录对应的物理权重
-                        if "_S" in out_name:
-                            j = int(out_name.split("_")[1])
-                            self.tb_output_ports.append((out_name, self.c_cols[j]))
-                        elif "_CO" in out_name:
-                            j = int(out_name.split("_")[1])
-                            self.tb_output_ports.append((out_name, self.c_cols[j] + 1)) # 进位权重 +1
-                         
-            if output_ports:
-                f.write(f",\n    output wire {', '.join(output_ports)}\n);\n\n")
-            else:
-                f.write("\n);\n\n")
-            
-            f.write("    // Internal wire declarations\n")
-            for j in range(self.num_c):
-                s_wire = f"comp_{j}_S"
-                co_wire = f"comp_{j}_CO"
-                if s_wire not in output_ports: f.write(f"    wire {s_wire};\n")
-                if co_wire not in output_ports: f.write(f"    wire {co_wire};\n")
-            f.write("\n")
-            
-            if assign_statements:
-                f.write("    // Feed-through assignments\n")
-                f.write("\n".join(assign_statements) + "\n\n")
-
-            f.write("    // Compressor Tree Instantiations\n")
-            for j in range(self.num_c):
-                c_type = self.c_types[j]
-                impl_idx = discrete_P[j]
-                
-                if c_type == 'FA':
-                    cell_name = self.fa_cell_names[impl_idx]
-                    inputs = ['A', 'B', 'CI']
-                else:
-                    cell_name = self.ha_cell_names[impl_idx]
-                    inputs = ['A', 'B']
-                    
-                f.write(f"    {cell_name} U_comp_{j} (\n")
-                
-                for p_idx, pin_name in enumerate(inputs):
-                    col_idx = j * 3 + p_idx 
-                    connected_source = None
-                    for i in range(total_nodes):
-                        if discrete_M[i, col_idx] == 1.0:
-                            connected_source = wire_names[i]
-                            break
-                    if connected_source is None:
-                        raise ValueError(f"[物理崩塌] 压缩器 {j} 的 {pin_name} 引脚悬空！")
-                    f.write(f"        .{pin_name}({connected_source}),\n")
-                
-                f.write(f"        .S(comp_{j}_S),\n        .CO(comp_{j}_CO)\n    );\n\n")
-            f.write("endmodule\n")
-            
-        print(f"[VerilogGen] 物理网表已成功封盒！")
-
-    def generate_testbench(self, tb_file="tb_domac.v", netlist_file="domac_result.v"):
-        """
-        [Dr. Gemini 可视化版] 动态生成带“算式直播”的权重守恒测试平台
-        """
-        print(f"[VerilogGen] 正在锻造带算式输出的自校验 Testbench: {tb_file}")
-        with open(tb_file, 'w') as f:
-            f.write("`timescale 1ns/1ps\n\n")
-            
-            f.write("// ================= TSMC Mock Behavioral Models =================\n")
-            for fa_name in set(self.fa_cell_names):
-                f.write(f"module {fa_name} (input A, B, CI, output S, CO);\n")
-                f.write("    assign {CO, S} = A + B + CI;\n")
-                f.write("endmodule\n")
-            for ha_name in set(self.ha_cell_names):
-                f.write(f"module {ha_name} (input A, B, output S, CO);\n")
-                f.write("    assign {CO, S} = A + B;\n")
-                f.write("endmodule\n\n")
-                
-            f.write("module tb_domac;\n")
-            
-            pp_regs = [f"pp_in_{i}" for i in range(self.num_pp)]
-            f.write(f"    reg {', '.join(pp_regs)};\n")
-            
-            out_wires = [port[0] for port in self.tb_output_ports]
-            f.write(f"    wire {', '.join(out_wires)};\n\n")
-            
-            f.write(f"    {self.module_name} DUT (\n")
-            all_ports = pp_regs + out_wires
-            f.write(",\n".join([f"        .{p}({p})" for p in all_ports]))
-            f.write("\n    );\n\n")
-            
-            # 使用 64 位整数 (reg [63:0]) 防止大位宽乘法器权重溢出
-            f.write("    reg [63:0] expected_weight, actual_weight;\n")
-            f.write("    integer i;\n")
-            f.write("    integer error_count = 0;\n\n")
-            
-            f.write("    initial begin\n")
-            f.write("        $display(\"\\n============================================================\");\n")
-            f.write("        $display(\" [DOMAC 算术验证中心] 启动权重守恒算式核对\");\n")
-            f.write("        $display(\"============================================================\\n\");\n")
-            
-            f.write("        for (i = 0; i < 1000; i = i + 1) begin\n")
-            
-            for i, p_reg in enumerate(pp_regs):
-                f.write(f"            {p_reg} = $random % 2;\n")
-                
-            f.write("            #5; // 模拟信号穿过组合逻辑的延迟\n\n")
-            
-            f.write("            expected_weight = 0")
-            for i, p_reg in enumerate(pp_regs):
-                f.write(f" + ({p_reg} * (64'h1 << {self.pp_cols[i]}))")
-            f.write(";\n")
-            
-            f.write("            actual_weight = 0")
-            for out_name, weight in self.tb_output_ports:
-                f.write(f" + ({out_name} * (64'h1 << {weight}))")
-            f.write(";\n\n")
-            
-            # ======== [核心修改：终端直播打印] ========
-            f.write("            // 打印前 20 次和每 100 次的详细算式，防止终端刷屏卡死\n")
-            f.write("            if (i < 20 || i % 100 == 0) begin\n")
-            f.write("                if (expected_weight === actual_weight)\n")
-            f.write("                    $display(\"  [Test %04d] 算式成立: 📥 进件总值 %10d  ===  📤 产出总值 %10d   [✔ PASS]\", i, expected_weight, actual_weight);\n")
-            f.write("                else\n")
-            f.write("                    $display(\"  [Test %04d] 算式崩塌: 📥 进件总值 %10d  =!=  📤 产出总值 %10d   [❌ FAIL]\", i, expected_weight, actual_weight);\n")
-            f.write("            end\n")
-            
-            f.write("            if (expected_weight !== actual_weight) begin\n")
-            f.write("                error_count = error_count + 1;\n")
-            f.write("            end\n")
-            f.write("        end\n\n")
-            
-            f.write("        $display(\"\\n============================================================\");\n")
-            f.write("        if (error_count == 0)\n")
-            f.write("            $display(\" 🎉 [Testbench] 1000 次算式核对完美通过！拓扑绝对守恒！\");\n")
-            f.write("        else\n")
-            f.write("            $display(\" 💥 [Testbench] 验证失败，共发现 %0d 个权重流失错误！\", error_count);\n")
-            f.write("        $display(\"============================================================\\n\");\n")
-            
-            f.write("        $finish;\n")
-            f.write("    end\n")
-            f.write("endmodule\n")        
-        print(f"[VerilogGen] Testbench 可视化升级完毕！")
-
-    def generate_multiplier_top(self, bit_width, top_file="domac.v", ct_module_name="domac_compressor_tree", top_module_name="domac"):
-        """
-        自动生成完整的乘法器顶层封装模块
-        包含: PPG (部分积生成阵列) + CT (DOMAC 压缩树) + CPA (末级加法器)
-        """
-        print(f"[VerilogGen] 正在组装完整乘法器顶层模块: {top_file}")
-        
-        out_width = bit_width * 2
-        
-        with open(top_file, 'w') as f:
-            f.write(f"`timescale 1ns/1ps\n\n")
-            f.write(f"module {top_module_name} (\n")
-            f.write(f"    input  wire [{bit_width-1}:0] A,\n")
-            f.write(f"    input  wire [{bit_width-1}:0] B,\n")
-            f.write(f"    output wire [{out_width-1}:0] P\n")
-            f.write(f");\n\n")
-            
-            f.write("    // ==========================================\n")
-            f.write("    // 1. Partial Product Generator (PPG) 阵列\n")
-            f.write("    // ==========================================\n")
-            pp_wire_names = []
-            k = 0
-            for i in range(bit_width):
-                for j in range(bit_width):
-                    wire_name = f"pp_in_{k}"
-                    pp_wire_names.append(wire_name)
-                    # 硬件并行生成部分积：A的第i位 AND B的第j位
-                    f.write(f"    wire {wire_name} = A[{i}] & B[{j}];\n")
-                    k += 1
-            f.write("\n")
-            
-            f.write("    // ==========================================\n")
-            f.write("    // 2. DOMAC AI 优化压缩树 (CT)\n")
-            f.write("    // ==========================================\n")
-            # 声明 CT 输出的那些毫无规律的杂散线
-            out_wires = [port[0] for port in self.tb_output_ports]
-            f.write(f"    wire {', '.join(out_wires)};\n\n")
-            
-            f.write(f"    {ct_module_name} U_CT (\n")
-            
-            # 绑定输入
-            port_bindings = []
-            for i in range(self.num_pp):
-                port_bindings.append(f"        .pp_in_{i}(pp_in_{i})")
-            
-            # 绑定输出
-            for out_name in out_wires:
-                port_bindings.append(f"        .{out_name}({out_name})")
-                
-            f.write(",\n".join(port_bindings) + "\n")
-            f.write("    );\n\n")
-            
-            f.write("    // ==========================================\n")
-            f.write("    // 3. Carry-Propagate Adder (CPA) 加法器\n")
-            f.write("    // ==========================================\n")
-            f.write("    // 将压缩树残留的杂散信号按二进制权重对齐重建，送入高速 CPA\n")
-            
-            # 分类收集不同权重的信号
-            col_signals = {w: [] for w in range(out_width)}
-            for out_name, weight in self.tb_output_ports:
-                col_signals[weight].append(out_name)
-                
-            # 动态重建向量: 保证能够被标准的 assign P = vec0 + vec1 完美吸收
-            # 如果某列刚好压缩到剩 2 根线，这里就会生成 vec_0 和 vec_1 两个 32-bit 向量
-            max_depth = max([len(sigs) for sigs in col_signals.values()])
-            
-            vec_names = []
-            for d in range(max_depth):
-                vec_name = f"cpa_vec_{d}"
-                vec_names.append(vec_name)
-                f.write(f"    wire [{out_width-1}:0] {vec_name};\n")
-                
-                # 为该向量的每一位赋值
-                for w in range(out_width):
-                    if d < len(col_signals[w]):
-                        f.write(f"    assign {vec_name}[{w}] = {col_signals[w][d]};\n")
-                    else:
-                        f.write(f"    assign {vec_name}[{w}] = 1'b0; // 缺位补零\n")
-                f.write("\n")
-            
-            f.write("    // 综合工具 (Design Compiler) 会将下述加法自动推断为极速并行前缀加法器\n")
-            sum_expr = " + ".join(vec_names)
-            f.write(f"    assign P = {sum_expr};\n\n")
-            
-            f.write("endmodule\n")
-            
-        print(f"[VerilogGen] 顶层模块封装完毕！可直接送入综合工具。")
-
-    def generate_pure_dadda_baseline(self, bit_width, output_file="dadda_baseline_ct.v", top_file="dadda.v"):
-        """
-        [Dr. Gemini 基准线生成器] 直接输出纯正的 Dadda Tree 初始 Verilog 网表
-        用于控制变量法对照实验 (Control Experiment)
-        """
-        print(f"\n[BaselineGen] 启动纯血 Dadda Tree 基准网表生成器...")
-        
-        # 默认使用索引 0 的物理单元作为基础构建块 (通常是驱动最小的 D0 或基础 D1)
-        fa_name = self.fa_cell_names[0]
-        ha_name = self.ha_cell_names[0]
-        
-        max_cols = bit_width * 2 - 1
-        signals = [[] for _ in range(max_cols)]
-        
-        # 1. 初始化部分积信号池
-        k = 0
-        for i in range(bit_width):
-            for j in range(bit_width):
-                signals[i+j].append(f"pp_in_{k}")
-                k += 1
-                
-        # 2. 推导目标高度序列
-        dadda_seq = [2]
-        while dadda_seq[-1] < bit_width:
-            dadda_seq.append(int(dadda_seq[-1] * 1.5))
-        dadda_seq.reverse()
-        targets = [t for t in dadda_seq if t < max([len(col) for col in signals])]
-        
-        verilog_lines = []
-        comp_idx = 0
-        
-        # 3. 严格遵循 Dadda 算法逐级收敛连线
-        for stage_idx, target in enumerate(targets):
-            next_signals = [[] for _ in range(max_cols + 1)]
-            carry_from_prev = []
-            
-            for col in range(len(signals)):
-                # Dadda 物理连线法则：当前列未压缩的点 + 上一列传来的进位，共同构成当前列的总点数
-                current_sigs = signals[col] + carry_from_prev
-                V = len(current_sigs)
-                
-                if V > target:
-                    reduction_needed = V - target
-                    f = reduction_needed // 2
-                    h = reduction_needed % 2
-                    
-                    carries_generated = []
-                    
-                    for _ in range(f):
-                        s1 = current_sigs.pop()
-                        s2 = current_sigs.pop()
-                        s3 = current_sigs.pop()
-                        s_out = f"comp_{comp_idx}_S"
-                        co_out = f"comp_{comp_idx}_CO"
-                        verilog_lines.append(f"    {fa_name} U_comp_{comp_idx} (.A({s1}), .B({s2}), .CI({s3}), .S({s_out}), .CO({co_out}));")
-                        comp_idx += 1
-                        next_signals[col].append(s_out)
-                        carries_generated.append(co_out)
-                        
-                    for _ in range(h):
-                        s1 = current_sigs.pop()
-                        s2 = current_sigs.pop()
-                        s_out = f"comp_{comp_idx}_S"
-                        co_out = f"comp_{comp_idx}_CO"
-                        verilog_lines.append(f"    {ha_name} U_comp_{comp_idx} (.A({s1}), .B({s2}), .S({s_out}), .CO({co_out}));")
-                        comp_idx += 1
-                        next_signals[col].append(s_out)
-                        carries_generated.append(co_out)
-                        
-                    next_signals[col].extend(current_sigs)
-                    carry_from_prev = carries_generated
-                else:
-                    next_signals[col].extend(current_sigs)
-                    carry_from_prev = []
-                    
-            if carry_from_prev:
-                if len(signals) >= len(next_signals):
-                    next_signals.append([])
-                next_signals[len(signals)].extend(carry_from_prev)
-                
-            signals = next_signals
-
-        while signals and not signals[-1]:
-            signals.pop()
-            
-        # 4. 收集最终输出端口与权重映射
-        outputs_with_weights = []
-        assign_lines = []
-        for col, sigs in enumerate(signals):
-            for sig in sigs:
-                if sig.startswith("pp_in_"):
-                    # 如果有初级信号一刀未剪直达底层，需赋予别名
-                    out_name = f"out_{sig}"
-                    assign_lines.append(f"    assign {out_name} = {sig};")
-                    outputs_with_weights.append((out_name, col))
-                else:
-                    outputs_with_weights.append((sig, col))
-                    
-        # 5. 生成压缩树 (CT) 网表文件
-        with open(output_file, 'w') as f:
-            f.write("module dadda_baseline_ct (\n")
-            inputs = [f"pp_in_{i}" for i in range(bit_width * bit_width)]
-            f.write(f"    input wire {', '.join(inputs)},\n")
-            outputs = [name for name, _ in outputs_with_weights]
-            f.write(f"    output wire {', '.join(outputs)}\n")
-            f.write(");\n\n")
-            
-            internal_wires = [f"comp_{i}_S" for i in range(comp_idx)] + [f"comp_{i}_CO" for i in range(comp_idx)]
-            internal_wires_to_declare = [w for w in internal_wires if w not in outputs]
-            
-            if internal_wires_to_declare:
-                f.write("    wire ")
-                for idx, w in enumerate(internal_wires_to_declare):
-                    f.write(w)
-                    if idx < len(internal_wires_to_declare) - 1:
-                        f.write(", ")
-                    if (idx + 1) % 10 == 0:
-                        f.write("\n         ")
-                f.write(";\n\n")
-                
-            if assign_lines:
-                f.write("\n".join(assign_lines) + "\n\n")
-                
-            f.write("\n".join(verilog_lines))
-            f.write("\nendmodule\n")
-
-        # 6. 巧妙复用已有的生成器，组装顶层乘法器 (Top Module)
-        original_tb_ports = self.tb_output_ports
-        self.tb_output_ports = outputs_with_weights
-        
-        # 显式指定对照组的 Top 模块名为 dadda
-        self.generate_multiplier_top(bit_width, top_file=top_file, ct_module_name="dadda_baseline_ct", top_module_name="dadda")
-        
-        self.tb_output_ports = original_tb_ports # 恢复现场
-        print(f"[BaselineGen] 纯血 Dadda 初始基准网表生成完毕！")
-        print(f"  -> CT 核心网表: {output_file}")
-        print(f"  -> Top 顶层装配: {top_file}")
-
 ```
 
