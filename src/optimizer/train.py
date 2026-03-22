@@ -6,7 +6,7 @@ import torch.profiler
 class DOMACTrainer:
     def __init__(self, model, loss_engine, lr=0.01):
         """
-        DOMAC 训练引擎 (Dr. Gemini 性能探针版)
+        DOMAC 训练引擎 (Dr. Gemini 性能探针版 + 并发进度回调支持)
         """
         self.model = model
         self.loss_engine = loss_engine
@@ -26,13 +26,14 @@ class DOMACTrainer:
         # }
 
         self.hyperparams = {
-            't1': 1.7,     # WNS 权重拉到极致，逼迫网络突破延迟极限
+            't1': 1.8,     # WNS 权重拉到极致，逼迫网络突破延迟极限
             't2': 0.1,       # TNS 辅助全局路径寻优
             'alpha': 1,    # 【封印】前期绝对不许管面积！
-            'lambda1': 0.1,  # 连线合法性是必须的
-            'lambda2': 0.5,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
-            'tau_k':0.975,
+            'lambda1': 0.18,  # 连线合法性是必须的
+            'lambda2': 0.42,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+            'tau_k':0.985,
         }
+
     def update_hyperparameters(self, epoch):
         if epoch >= 100:
             self.hyperparams['alpha'] *= 1.003
@@ -62,7 +63,9 @@ class DOMACTrainer:
     #         self.hyperparams['lambda2'] *= 1.05  
     #         self.hyperparams['alpha'] *= 1.002
 
-    def train(self, pp_at, pp_slew, max_epochs=300):
+    # ================= [修改点 1：增加 epoch_callback 参数] =================
+    def train(self, pp_at, pp_slew, max_epochs=300, epoch_callback=None):
+    # ========================================================================
         print(f"[Optimizer] 启动 DOMAC 训练循环，最大迭代次数: {max_epochs}")
         print(f"[Profiler] 性能探针已植入。正在监控 Forward, Loss, Backward, Step 耗时...")
         
@@ -76,8 +79,8 @@ class DOMACTrainer:
             # ================= [新增：极其暴力的温度退火] =================
             # 指数级降温：Epoch 0 时 tau=1.0，Epoch 300 时 tau 接近 0.05
             # 这会把 AI 伪造的 "冰块概率" 强行压成 0，暴露出真实的延迟！
-            current_tau_k = self.hyperparams.get('tau_k', 0.98)
-            current_tau = max(0.05, 1.0 * (current_tau_k ** epoch))
+            current_tau_k = self.hyperparams.get('tau_k')
+            current_tau = max(0.2, 1.0 * (current_tau_k ** epoch))
             # current_tau = 1
             # # ================= [修复：三段式科学退火调度] =================
             # if epoch < 60:
@@ -124,8 +127,15 @@ class DOMACTrainer:
             t4 = time.time()
             acc_step += (t4 - t3)
             
+            # ================= [修改点 2：触发全局进度条回调] =================
+            # 将当前 epoch 和最新的 WNS 传递给主进程的 tqdm 监听器
+            if epoch_callback is not None:
+                current_wns_val = loss_dict['wns'].item() if 'wns' in loss_dict else 0.0
+                epoch_callback(epoch, current_wns_val)
+            # ==================================================================
+
             # 每 20 步打印一次物理指标与性能报告
-            if epoch % 5 == 0 or epoch == max_epochs - 1:
+            if epoch % 20 == 0 or epoch == max_epochs - 1:
                 print(f"\nEpoch {epoch:03d} | "
                       f"WNS: {loss_dict['wns'].item():.4f} | "
                       f"Area: {loss_dict['area'].item():.4f} | "
@@ -158,7 +168,7 @@ class DOMACTrainer:
                 col_B = last_c_idx * 3 + 1
                 col_CI = last_c_idx * 3 + 2
                 print(f"  -> [探针] 末端加法器_{last_c_idx} 的主来源概率 - A:{max_probs_per_pin[col_A]:.4f}, B:{max_probs_per_pin[col_B]:.4f}, CI:{max_probs_per_pin[col_CI]:.4f}")
-                # 清零累加器，准备下一个周期的监控
+                
                 # ================= [深度时序探针：揭露 AT 概率稀释真相] =================
                 pin_ats = self.model._probe_pin_ats
                 node_ats = self.model._probe_node_ats
@@ -186,6 +196,7 @@ class DOMACTrainer:
                 print(f"  ⚠️  [物理真相警告] 若此时 Legalizer 强行硬连最大概率线, 该引脚真实 AT 将瞬间暴涨至 -> {worst_physical_at:.4f} ns!\n")
                 # ====================================================================
                 
+                # 清零累加器，准备下一个周期的监控
                 acc_forward, acc_loss, acc_backward, acc_step = 0.0, 0.0, 0.0, 0.0
 
         print("[Optimizer] 训练收敛完成。")

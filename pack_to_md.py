@@ -9,7 +9,7 @@ def pack_codebase_to_md(root_dir, output_file="DOMAC_Codebase.md", extensions=('
     ignore_dirs = {'.git', '__pycache__', '.pytest_cache', 'venv', 'env', 'output'}
     
     # 文件级物理隔离：防止脚本自我吞噬或引入无关测试干扰 AI 推理
-    ignore_files = {'pack_to_md.py', 'check.py','tune_t1.py','tune.py','verilog_gen.py'}
+    ignore_files = {'pack_to_md.py', 'check.py','tune_t1.py','tune.py'}
 
     with open(output_file, 'w', encoding='utf-8') as md_file:
         md_file.write("# DOMAC_TSMC28 工程代码全局快照\n\n")
