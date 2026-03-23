@@ -26,12 +26,12 @@ class DOMACTrainer:
         # }
 
         self.hyperparams = {
-            't1': 1.8,     # WNS 权重拉到极致，逼迫网络突破延迟极限
+            't1': 2.2,     # WNS 权重拉到极致，逼迫网络突破延迟极限
             't2': 0.1,       # TNS 辅助全局路径寻优
             'alpha': 1,    # 【封印】前期绝对不许管面积！
-            'lambda1': 0.18,  # 连线合法性是必须的
-            'lambda2': 0.5,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
-            'tau_k':0.985,
+            'lambda1': 0.21,  # 连线合法性是必须的
+            'lambda2': 0.4,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+            'tau_k':0.9835,
         }
 
     def update_hyperparameters(self, epoch):

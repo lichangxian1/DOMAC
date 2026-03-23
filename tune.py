@@ -19,7 +19,7 @@ from src.core.compressor_tree import DOMAC_CompressorTree
 from src.core.objectives import DOMACLossFunction
 from src.optimizer.train import DOMACTrainer
 from src.optimizer.legalizer import DOMACLegalizer
-from domac import generate_multiplier_canvas
+from src.core.domac_utils import generate_multiplier_canvas
 
 class HiddenPrints:
     def __enter__(self):
