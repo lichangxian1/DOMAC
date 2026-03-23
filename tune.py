@@ -6,8 +6,10 @@ import numpy as np
 import pandas as pd
 import multiprocessing as mp
 import threading 
+import time
+from collections import deque  # <--- 新增导入
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from tqdm import tqdm  
+from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -27,16 +29,59 @@ class HiddenPrints:
         sys.stdout.close()
         sys.stdout = self._original_stdout
 
+# ================= [修改 2：替换 progress_listener 函数] =================
 def progress_listener(queue, total_epochs):
-    with tqdm(total=total_epochs, desc="[CUDA Epoch 寻优轰炸]", unit="ep", dynamic_ncols=True) as pbar:
+    # 使用自定义格式，隐藏默认的 ETA 和速度，通过 postfix 注入我们自己计算的 5秒平均值
+    custom_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{postfix}]"
+    
+    with tqdm(total=total_epochs, desc="[CUDA Epoch 寻优轰炸]", dynamic_ncols=True, bar_format=custom_format) as pbar:
+        # history 队列存储元组: (timestamp, 已完成的 epochs 数量)
+        history = deque()
+        history.append((time.time(), 0))
+        current_wns = "N/A"
+        
         while True:
             msg = queue.get()
             if msg == "DONE":
                 break
             elif isinstance(msg, dict):
-                pbar.set_postfix(msg)
+                if 'WNS_探针' in msg:
+                    current_wns = msg['WNS_探针']
             elif isinstance(msg, int):
                 pbar.update(msg)
+            
+            # --- 5秒滑动窗口计算逻辑 ---
+            current_t = time.time()
+            current_n = pbar.n
+            history.append((current_t, current_n))
+            
+            # 清理超过 5 秒的历史记录，但至少保留最旧的一个点用来算速度
+            while len(history) > 1 and (current_t - history[0][0]) > 5.0:
+                history.popleft()
+            
+            time_diff = current_t - history[0][0]
+            if time_diff > 0:
+                speed = (current_n - history[0][1]) / time_diff
+            else:
+                speed = 0.0
+            
+            # 计算动态 ETA
+            if speed > 0:
+                eta_sec = (total_epochs - current_n) / speed
+                m, s = divmod(int(eta_sec), 60)
+                h, m = divmod(m, 60)
+                if h > 0:
+                    eta_str = f"{h:02d}:{m:02d}:{s:02d}"
+                else:
+                    eta_str = f"{m:02d}:{s:02d}"
+            else:
+                eta_str = "??"
+                
+            # 格式化输出字符串：例如 "19:38:56,  2.12ep/s, WNS_探针=0.3705ns"
+            postfix_str = f"{eta_str}, {speed:.2f}ep/s, WNS_探针={current_wns}"
+            
+            # 注入自定义的 postfix (无需刷新，下次 update 时会自动渲染)
+            pbar.set_postfix_str(postfix_str, refresh=False)
 
 # ================= [对齐 3：100% 对齐 domac.py 的 1e4 极端硬化验证逻辑] =================
 def evaluate_discrete_physical_metrics(model, loss_engine, hyperparams, discrete_M, discrete_P, pp_at, pp_slew, c_types, active_pin_mask):
@@ -165,7 +210,7 @@ def main():
     print(" [DOMAC Cluster] 大规模并行网格搜索引擎 (Multi-Process CUDA版)")
     print("="*70)
     
-    MAX_CONCURRENT_WORKERS = 6 
+    MAX_CONCURRENT_WORKERS = 12 
     
     # TUNING_CONFIG = {
     #     # 't1':{'start': 0, 'end': 4, 'step': 0.2},     # WNS 权重
@@ -176,6 +221,21 @@ def main():
     #     # 'tau_k':{'start': 0.97, 'end': 0.99, 'step': 0.005},  # 降温系数
     # }
     
+# 总组合数: 5 * 5 * 1 * 4 * 5 * 1 = 500 组并行仿真
+    TUNING_CONFIG = {
+        # [轴 1: 物理极限压榨与寄生电容的高精微雕 (25宫格)]
+        't1':      {'start': 1.4,  'end': 2.2,  'step': 0.2},  # 5组: [1.4, 1.6, 1.8, 2.0, 2.2]
+        # 'alpha':   {'start': 0.6,  'end': 1.4,  'step': 0.2},  # 5组: [0.6, 0.8, 1.0, 1.2, 1.4]
+        
+        # [被彻底冻结的次要与环境参数]
+        't2':      {'start': 0.1,  'end': 0.1,  'step': 1.0},  # 1组: [0.1] (仅作路径清理，无需调)
+        'tau_k':   {'start': 0.981,'end': 0.990,'step': 0.0025},  # 1组: [0.985] (最稳健的探索期底座)
+        
+        # [轴 2: 拓扑合法性与离散坍缩的“走钢丝”极限测试]
+        'lambda1': {'start': 0.15, 'end': 0.21, 'step': 0.02}, # 4组: [0.15, 0.17, 0.19, 0.21]
+        'lambda2': {'start': 0.3,  'end': 0.7,  'step': 0.1},  # 5组: [0.3, 0.4, 0.5, 0.6, 0.7]
+    }
+
     keys = list(TUNING_CONFIG.keys())
     value_lists = [np.arange(cfg['start'], cfg['end'] + cfg['step'] * 0.1, cfg['step']).tolist() for cfg in TUNING_CONFIG.values()]
     combinations = list(itertools.product(*value_lists))
