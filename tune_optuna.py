@@ -104,26 +104,36 @@ def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_co
 
     def objective(trial):
         param_combination = {
-            't1': trial.suggest_float('t1', 1.8, 2.6, step=0.1),       
+            't1': trial.suggest_float('t1', 1, 4, step=0.1),       
+            't2': trial.suggest_float('t2', 0.05, 0.4),  
             'lambda1': trial.suggest_float('lambda1', 0.15, 0.25, step=0.01), 
-            'lambda2': trial.suggest_float('lambda2', 0.2, 0.6, step=0.05),
-            't2': 0.4,         
-            'tau_k': 0.9835     
-            # 't1': trial.suggest_float('t1', 1.0, 3.0)
+            'lambda2': trial.suggest_float('lambda2', 0.1, 0.6, step=0.02),
+            'tau_k':trial.suggest_float('tau_k', 0.97, 0.995, step=0.001),
+            # [新增] 拓扑初始化的随机种子，搜索空间设为 0 到 1000
+            'seed': 42,
+            #trial.suggest_int('seed', 0, 100),
+            'max_epochs':trial.suggest_int('max_epochs', 200, 400),
+            # [新增] 高斯噪声的权重，使用对数分布 (从 0.001 到 0.1)
+            'init_noise_std': trial.suggest_float('init_noise_std', 0.001, 0.1, log=True)
         }
         
-        FIXED_SEED = 42 
+# 2. 从字典中提取并应用动态随机种子
+        FIXED_SEED = param_combination['seed']
         torch.manual_seed(FIXED_SEED)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(FIXED_SEED)
 
-        init_m_cpu = torch.randn((total_nodes, total_target_pins + 1)) * 0.01
+        # 3. 动态应用高斯分布权重来打破拓扑对称性
+        noise_std = param_combination['init_noise_std']
+        init_m_cpu = torch.randn((total_nodes, total_target_pins + 1)) * noise_std
         init_m = init_m_cpu.to(device)
+        
+        # 物理选择概率矩阵依然保持全零初始化，因为门类型的选择不需要打破对称性
         init_p_cpu = torch.zeros((len(comp_cols), max_impls))
         init_p = init_p_cpu.to(device)
         
         completed_epochs = 0
-        MAX_EPOCHS = 300
+        MAX_EPOCHS = param_combination['max_epochs']
 
         def epoch_callback_fn(epoch, current_wns):
             nonlocal completed_epochs
@@ -197,7 +207,7 @@ def main():
     print("="*70)
     
     with HiddenPrints():
-        TARGET_CELLS = ['FA1D1BWP12T40P140', 'HA1D1BWP12T40P140']
+        TARGET_CELLS = ['FA1D0BWP12T40P140', 'HA1D0BWP12T40P140','FA1D1BWP12T40P140', 'HA1D1BWP12T40P140','FA1D2BWP12T40P140', 'HA1D2BWP12T40P140','FA1D4BWP12T40P140', 'HA1D4BWP12T40P140']
         lib_path = "/home/changxian/library/t28_official/tcbn28hpcplusbwp12t40p140tt0p9v25c.lib"
         parser = NLDMParser(lib_path, TARGET_CELLS)
         nldm_db = parser.parse()
@@ -206,19 +216,15 @@ def main():
         BIT_WIDTH = 8
         pp_cols, comp_cols, c_types = generate_multiplier_canvas(BIT_WIDTH)
 
-    TOTAL_TRIALS = 60
+    TOTAL_TRIALS = 500
     CONCURRENT_WORKERS = 8
     
     # 计算每个 Worker 负责多少个 Trial
     trials_per_worker = [TOTAL_TRIALS // CONCURRENT_WORKERS + (1 if x < TOTAL_TRIALS % CONCURRENT_WORKERS else 0) for x in range(CONCURRENT_WORKERS)]
 
     # ================= [准备 Optuna 共享数据库] =================
-    storage_url = "sqlite:///domac_optuna.db"
-    study_name = "domac_tuning"
-    
-    # 每次新跑前，清理上次的旧数据库，确保纯净开局
-    if os.path.exists("domac_optuna.db"):
-        os.remove("domac_optuna.db")
+    storage_url = f"sqlite:///domac_optuna_{BIT_WIDTH}bit.db"
+    study_name = f"domac_tuning_{BIT_WIDTH}bit"
         
     pruner = optuna.pruners.MedianPruner(n_warmup_steps=50, n_startup_trials=5)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -228,7 +234,8 @@ def main():
         study_name=study_name,
         storage=storage_url, 
         direction="minimize", 
-        pruner=pruner
+        pruner=pruner,
+        load_if_exists=True  # 核心：如果库已经存在，就加入进去一起跑！
     )
 
     # ================= [启动全局队列与监听线程] =================
@@ -237,6 +244,7 @@ def main():
     total_global_epochs = TOTAL_TRIALS * 300 
     
     listener_thread = threading.Thread(target=progress_listener, args=(progress_queue, total_global_epochs))
+    listener_thread.daemon = True
     listener_thread.start()
     
     # ================= [召唤原版 ProcessPoolExecutor] =================

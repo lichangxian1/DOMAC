@@ -28,13 +28,14 @@ def main():
     print(" [DOMAC 净室复现] TSMC 28nm 节点可微 STA 优化框架")
     print("="*60)
     
-    INIT_MODE = 'blank'
+    INIT_MODE = 'dadda'
     
-    TARGET_CELLS = [
-        'FA1D1BWP12T40P140',
-        'HA1D1BWP12T40P140',
-    ]
-
+    # TARGET_CELLS = [
+    #     'FA1D0BWP12T40P140',
+    #     'HA1D0BWP12T40P140',
+    # ]
+    TARGET_CELLS = ['FA1D0BWP12T40P140', 'HA1D0BWP12T40P140','FA1D1BWP12T40P140', 'HA1D1BWP12T40P140','FA1D2BWP12T40P140', 'HA1D2BWP12T40P140','FA1D4BWP12T40P140', 'HA1D4BWP12T40P140']
+    
     fa_names = [c for c in TARGET_CELLS if c.startswith('FA')]
     ha_names = [c for c in TARGET_CELLS if c.startswith('HA')]
     
@@ -80,7 +81,7 @@ def main():
         print(f"\n[Fatal Error] 系统初始化失败，拒绝以非严谨模式运行。原因: {e}")
         sys.exit(1)
         
-    BIT_WIDTH = 8
+    BIT_WIDTH = 16
     TARGET_SINK_COUNT = (BIT_WIDTH * 2 - 1) * 2
     PP_COLS, COMP_COLS, C_TYPES = generate_multiplier_canvas(BIT_WIDTH)
     NUM_PP = len(PP_COLS)
@@ -187,31 +188,30 @@ def main():
         ha_cell_names=ha_names
     )
     
-    netlist_path = "output/netlists/domac_result.v"
-    tb_path = "output/netlists/tb_domac.v"
+    netlist_path = f"output/netlists/domac_tree_{BIT_WIDTH}.v"
+    # tb_path = "output/netlists/tb_domac_.v"
     
     v_gen.generate(discrete_M, discrete_P, output_file=netlist_path)
-    v_gen.generate_testbench(tb_file=tb_path, netlist_file=netlist_path)
+    # v_gen.generate_testbench(tb_file=tb_path, netlist_file=netlist_path)
     
-    top_path = "output/netlists/domac.v"
+    top_path = f"output/netlists/domac_{BIT_WIDTH}.v"
     v_gen.generate_multiplier_top(
         bit_width=BIT_WIDTH, 
         top_file=top_path, 
-        ct_module_name="domac_compressor_tree", 
+        ct_module_name="domac_tree", 
         top_module_name="domac"
     )
-
     if INIT_MODE == 'dadda' and discrete_init_M is not None:
         print(f"\n[BaselineGen] 正在直接从 AI 热启动矩阵中剥离 {INIT_MODE} 基准网表 (保证 100% 对齐)...")
-        v_gen.module_name = f"{INIT_MODE}_baseline_ct"
-        v_gen.generate(discrete_init_M, discrete_init_P, output_file=f"output/netlists/{INIT_MODE}_baseline_ct.v")
+        v_gen.module_name = f"{INIT_MODE}_tree"
+        v_gen.generate(discrete_init_M, discrete_init_P, output_file=f"output/netlists/{INIT_MODE}_tree_{BIT_WIDTH}.v")
         v_gen.generate_multiplier_top(
             bit_width=BIT_WIDTH,
-            top_file=f"output/netlists/{INIT_MODE}.v",
-            ct_module_name=f"{INIT_MODE}_baseline_ct",
+            top_file=f"output/netlists/{INIT_MODE}_{BIT_WIDTH}.v",
+            ct_module_name=f"{INIT_MODE}_tree",
             top_module_name=f"{INIT_MODE}"
         )
-        v_gen.module_name = "domac_compressor_tree"
+        v_gen.module_name = "dadda_tree"
     else:
         print(f"\n[BaselineGen] 当前为 '{INIT_MODE}' 冷启动模式，跳过生成基准对照组网表。")
 

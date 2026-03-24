@@ -308,7 +308,47 @@ class DOMAC_CompressorTree(nn.Module):
         # # 使用引入了 CPA 惩罚的 AT 来计算 Slack
         # slacks = self.req_time - effective_ats_tensor
         # # =========================================================================
+# =========================================================================
+        # 🚀 [真实物理校准：可切换架构的 CPA 代理模型]
+        # =========================================================================
+        # 1. 计算每个节点流向外部 CPA (Sink) 的连续概率
+        sink_probs = 1.0 - torch.sum(M_internal, dim=1)
+        sink_probs = torch.clamp(sink_probs, min=0.0, max=1.0)
+        
+        # 2. 基于 2026-03 DC 综合报告提取的绝对真实参数
+        CPA_BIT_DELAY_RCA = 0.040      # 从报告得出: CI->CO 稳定在 0.04ns
+        CPA_BASE_DELAY_RCA = 0.090     # 首位 HA + 末位 S 输出的固定开销
+        
+        CPA_TREE_STAGE_DELAY = 0.035   # 高速前缀树(Kogge-Stone)单级延迟预估
+        CPA_BASE_DELAY_TREE = 0.055    # 树形加法器的基础进入延迟
 
+        max_col = max(self.node_cols)
+        cols_tensor = torch.tensor(self.node_cols, dtype=torch.float32, device=all_ats_tensor.device)
+        distance_to_msb = max_col - cols_tensor
+        
+        # =======================================================
+        # 模式切换开关：目前你的 DC 综合出的是 RCA，所以我们先用 RCA 模式训练！
+        # 如果你未来在 DC 里开出了前缀树，请把这里改成 'PREFIX_TREE'
+        # =======================================================
+        CPA_ARCHITECTURE = 'RCA' 
+        
+        if CPA_ARCHITECTURE == 'RCA':
+            # O(N) 线性惩罚模型，完美契合你刚刚贴出的 DC 综合网表！
+            cpa_latency = CPA_BASE_DELAY_RCA + distance_to_msb * CPA_BIT_DELAY_RCA
+        else:
+            # O(log2(N)) 对数模型，代表 DesignWare 里的顶级综合结果
+            cpa_latency = CPA_BASE_DELAY_TREE + CPA_TREE_STAGE_DELAY * torch.log2(distance_to_msb + 1.0)
+            
+        # 计算 CPA 综合惩罚
+        cpa_penalty = cpa_latency * sink_probs
+        
+        # 3. 融合 CPA 惩罚后的全局有效到达时间
+        effective_ats_tensor = all_ats_tensor + cpa_penalty
+        
+        # 4. 利用全链路时序计算最终的 Slack
+        slacks = self.req_time - effective_ats_tensor
+        # =========================================================================
+        
         negative_slacks = torch.clamp(slacks, max=0.0)
         
         WNS = smooth_max_lse(-negative_slacks, gamma=0.01) 

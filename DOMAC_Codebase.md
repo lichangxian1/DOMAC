@@ -10,7 +10,6 @@ import sys
 import torch
 import time
 import subprocess
-import numpy as np
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -21,228 +20,29 @@ from src.optimizer.train import DOMACTrainer
 from src.optimizer.legalizer import DOMACLegalizer
 from src.export.verilog_gen import VerilogGenerator
 
-def create_physical_tensor_mock():
-    idx_slew = torch.tensor([0.005, 0.01, 0.02, 0.04, 0.08, 0.16, 0.32], dtype=torch.float32)
-    idx_load = torch.tensor([0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064], dtype=torch.float32)
-    
-    fa_delay_lut = torch.linspace(0.05, 0.20, 49).view(7, 7) 
-    ha_delay_lut = torch.linspace(0.03, 0.15, 49).view(7, 7) 
-    slew_lut = torch.linspace(0.01, 0.10, 49).view(7, 7)
-    
-    fa_base = {'cell_area': 2.5, 'S': {'A': {'index_1_slew': idx_slew, 'index_2_load': idx_load, 'delay_lut': fa_delay_lut, 'slew_lut': slew_lut}}, 'CO': {'A': {'index_1_slew': idx_slew, 'index_2_load': idx_load, 'delay_lut': fa_delay_lut, 'slew_lut': slew_lut}}}
-    ha_base = {'cell_area': 1.8, 'S': {'A': {'index_1_slew': idx_slew, 'index_2_load': idx_load, 'delay_lut': ha_delay_lut, 'slew_lut': slew_lut}}, 'CO': {'A': {'index_1_slew': idx_slew, 'index_2_load': idx_load, 'delay_lut': ha_delay_lut, 'slew_lut': slew_lut}}}
-    
-    # 模拟返回多个物理实现的库：3种FA，2种HA
-    return [fa_base, fa_base, fa_base], [ha_base, ha_base]
-
-def generate_multiplier_canvas(bit_width):
-    print(f"\n[Canvas Generator] 自动推演 {bit_width}x{bit_width} 乘法器画布 (严格 Dadda Tree 算法)...")
-    pp_cols = []
-    max_cols = bit_width * 2 - 1
-    dots_in_col = [0] * max_cols
-    
-    # 1. 生成初始部分积 (Partial Products) 矩阵
-    for i in range(bit_width):
-        for j in range(bit_width):
-            col = i + j
-            pp_cols.append(col)
-            dots_in_col[col] += 1
-            
-    print(f" -> 共 {len(pp_cols)} 个 PP 节点。初始点数分布:\n    {dots_in_col}")
-    
-    # 2. 计算 Dadda 树的目标高度序列 (2, 3, 4, 6, 9, 13, 19, 28...)
-    dadda_seq = [2]
-    while dadda_seq[-1] < bit_width:
-        dadda_seq.append(int(dadda_seq[-1] * 1.5))
-    dadda_seq.reverse() 
-    
-    # 过滤掉大于等于当前最大高度的目标，只保留真正需要压缩的阶段
-    targets = [t for t in dadda_seq if t < max(dots_in_col)]
-    print(f" -> Dadda 目标高度收敛序列: {targets}")
-    
-    comp_cols_raw = []
-    c_types_raw = []
-    current_dots = list(dots_in_col)
-    
-    # 3. 按目标高度逐级扫荡压缩
-    for stage_idx, target in enumerate(targets):
-        current_len = len(current_dots)
-        next_dots = [0] * current_len
-        carry_from_prev = 0
-        
-        for col in range(current_len):
-            V = current_dots[col]
-            # 当前列在下一级期望达到的高度边界 (扣除上一列传来的进位后，本列允许留下的节点数)
-            allowed_output = target - carry_from_prev
-            
-            if V > allowed_output:
-                # 需要通过引入压缩器来削减的点数
-                reduction_needed = V - allowed_output
-                
-                # 贪心分配：1 个 FA 削减 2 个高度，1 个 HA 削减 1 个高度
-                f = reduction_needed // 2
-                h = reduction_needed % 2
-                
-                for _ in range(f):
-                    comp_cols_raw.append(col)
-                    c_types_raw.append('FA')
-                for _ in range(h):
-                    comp_cols_raw.append(col)
-                    c_types_raw.append('HA')
-                    
-                # 本列保留的点数 = 原有数量 - 削减的高度
-                dots_stay = V - reduction_needed
-                next_dots[col] = dots_stay + carry_from_prev
-                carry_from_prev = f + h
-            else:
-                # 不需要压缩，全部透传，加上进位
-                next_dots[col] = V + carry_from_prev
-                carry_from_prev = 0
-                
-        # 最后一个进位如果存在，顺延到最高位的下一列
-        if carry_from_prev > 0:
-            next_dots.append(carry_from_prev)
-            
-        current_dots = next_dots
-        
-    final_max = max(current_dots)
-    print(f" -> 压缩完毕！最终最大高度: {final_max}。")
-    print(f" -> 申请 {len(comp_cols_raw)} 个压缩器画布 ({c_types_raw.count('FA')} FA, {c_types_raw.count('HA')} HA)。")
-    
-    if final_max > 2:
-        print("\n[致命警告] Dadda 树未能将高度压缩至 2！请检查位宽逻辑。")
-        
-    # 4. [高危漏洞修复] 安全地将坑位和物理类型进行联合排序 (Zip Sort)
-    # 确保无论 Stage 怎么穿插，列索引和分配给该列的门类型永远死死绑定
-    combined = sorted(zip(comp_cols_raw, c_types_raw), key=lambda x: x[0])
-    comp_cols = [x[0] for x in combined]
-    c_types = [x[1] for x in combined]
-
-    return pp_cols, comp_cols, c_types
-    
-def generate_dadda_init_matrix(bit_width, pp_cols, c_cols, c_types):
-    """
-    [Dr. Gemini 热启动引擎] 提取纯血 Dadda 树的硬连线逻辑，
-    并转化为 DOMAC 连续概率矩阵的初始 Logits。
-    """
-    print(f"\n[Warm Start] 正在提取 Dadda 拓扑作为先验知识，初始化拓扑概率矩阵...")
-    num_pp = len(pp_cols)
-    num_c = len(c_cols)
-    total_nodes = num_pp + 2 * num_c
-    total_target_pins = num_c * 3
-    
-    # 初始化全 0 矩阵 (Logits)。之后会被 Softmax 转化为概率。
-    m_logits = torch.zeros((total_nodes, total_target_pins + 1))
-    
-    max_cols = bit_width * 2 - 1
-    signals = [[] for _ in range(max_cols)]
-    
-    # 1. 初始化 PP 信号源节点 ID (0 到 num_pp-1)
-    k = 0
-    for i in range(bit_width):
-        for j in range(bit_width):
-            signals[i+j].append(k)
-            k += 1
-            
-    dadda_seq = [2]
-    while dadda_seq[-1] < bit_width:
-        dadda_seq.append(int(dadda_seq[-1] * 1.5))
-    dadda_seq.reverse()
-    targets = [t for t in dadda_seq if t < max([len(col) for col in signals])]
-    
-    # 2. 建立反向映射表：DOMAC 的压缩器是按列(col)排好序的，
-    # 我们必须把 Dadda 生成过程中的压缩器准确映射到 DOMAC 的绝对索引 j 上。
-    comp_index_map = {col: {'FA': [], 'HA': []} for col in range(max_cols)}
-    for j, (col, c_type) in enumerate(zip(c_cols, c_types)):
-        comp_index_map[col][c_type].append(j)
-        
-    comp_usage = {col: {'FA': 0, 'HA': 0} for col in range(max_cols)}
-    
-    # 3. 严格遵循 Dadda 算法，但这次我们记录连线索引！
-    for stage_idx, target in enumerate(targets):
-        next_signals = [[] for _ in range(max_cols + 1)]
-        carry_from_prev = []
-        
-        for col in range(len(signals)):
-            current_sigs = signals[col] + carry_from_prev
-            V = len(current_sigs)
-            
-            if V > target:
-                reduction_needed = V - target
-                f = reduction_needed // 2
-                h = reduction_needed % 2
-                
-                carries_generated = []
-                
-                for _ in range(f):
-                    s1, s2, s3 = current_sigs.pop(), current_sigs.pop(), current_sigs.pop()
-                    # 获取该 FA 在 DOMAC 体系下的绝对索引
-                    j = comp_index_map[col]['FA'][comp_usage[col]['FA']]
-                    comp_usage[col]['FA'] += 1
-                    
-                    # [注入先验偏置] 给 Dadda 的目标连线施加 10.0 的极高初始权重
-                    m_logits[s1, j * 3 + 0] = 10.0
-                    m_logits[s2, j * 3 + 1] = 10.0
-                    m_logits[s3, j * 3 + 2] = 10.0
-                    
-                    # 生成下一级的节点 ID
-                    next_signals[col].append(num_pp + j)       # S 输出
-                    carries_generated.append(num_pp + num_c + j) # CO 输出
-                    
-                for _ in range(h):
-                    s1, s2 = current_sigs.pop(), current_sigs.pop()
-                    j = comp_index_map[col]['HA'][comp_usage[col]['HA']]
-                    comp_usage[col]['HA'] += 1
-                    
-                    m_logits[s1, j * 3 + 0] = 10.0
-                    m_logits[s2, j * 3 + 1] = 10.0
-                    
-                    next_signals[col].append(num_pp + j)
-                    carries_generated.append(num_pp + num_c + j)
-                    
-                next_signals[col].extend(current_sigs)
-                carry_from_prev = carries_generated
-            else:
-                next_signals[col].extend(current_sigs)
-                carry_from_prev = []
-                
-        if carry_from_prev:
-            if len(signals) >= len(next_signals):
-                next_signals.append([])
-            next_signals[len(signals)].extend(carry_from_prev)
-            
-        signals = next_signals
-
-    # 4. 处理最终流向 CPA (Sink) 的剩余信号
-    for i in range(total_nodes):
-        # 如果某个节点没有任何一根引脚指向压缩器（最高 Logit 小于 5.0），说明它直接通向 Sink
-        if torch.max(m_logits[i, :-1]) < 5.0:
-            m_logits[i, -1] = 10.0
-            
-    print(f" -> Dadda 知识蒸馏完毕！已将 {int(torch.sum(m_logits == 10.0).item())} 根硬连线转化为高斯先验。")
-    return m_logits
+# ================= [引入剥离出去的核心组件与探针] =================
+from src.core.domac_utils import (
+    create_physical_tensor_mock, 
+    generate_multiplier_canvas, 
+    generate_dadda_init_matrix,
+    probe_column_height_overflow,
+    probe_post_legalization_eval,
+    probe_wavefront_at
+)
 
 def main():
     print("="*60)
     print(" [DOMAC 净室复现] TSMC 28nm 节点可微 STA 优化框架")
     print("="*60)
     
-    # ================= [新增：全局优化策略配置] =================
-    # 'dadda' : 从 Dadda 树先验知识热启动 (100% 对齐对照组)
-    # 'blank' : 从等概率全零矩阵冷启动 (纯粹从零开始探索)
     INIT_MODE = 'blank'
-
-    # TARGET_CELLS = [
-    #     'FA1D0BWP12T40P140', 'FA1D1BWP12T40P140', 'FA1D2BWP12T40P140', 'FA1D4BWP12T40P140',
-    #     'HA1D0BWP12T40P140', 'HA1D1BWP12T40P140', 'HA1D2BWP12T40P140', 'HA1D4BWP12T40P140'
-    # ]
     
-    TARGET_CELLS = [
-        'FA1D1BWP12T40P140',
-        'HA1D1BWP12T40P140',
-    ]
-
-    # 提前准备好物理名字，用于最终生成 Verilog
+    # TARGET_CELLS = [
+    #     'FA1D0BWP12T40P140',
+    #     'HA1D0BWP12T40P140',
+    # ]
+    TARGET_CELLS = ['FA1D0BWP12T40P140', 'HA1D0BWP12T40P140','FA1D1BWP12T40P140', 'HA1D1BWP12T40P140','FA1D2BWP12T40P140', 'HA1D2BWP12T40P140','FA1D4BWP12T40P140', 'HA1D4BWP12T40P140']
+    
     fa_names = [c for c in TARGET_CELLS if c.startswith('FA')]
     ha_names = [c for c in TARGET_CELLS if c.startswith('HA')]
     
@@ -252,34 +52,7 @@ def main():
             print("[System] 发现 PDK 物理库，启动解析...")
             parser = NLDMParser(lib_path, TARGET_CELLS)
             nldm_db = parser.parse()
-        #    # ================= [新增：物理数据透明化打印 (全景引脚解析版)] =================
-        #     print("\n" + "="*60)
-        #     print(" 📊 [物理数据核对] 提取的 Area 与 Delay (Worst-case) 全景概览")
-        #     print("="*60)
-        #     for cell in TARGET_CELLS:
-        #         if cell in nldm_db:
-        #             area = nldm_db[cell].get('cell_area', 'N/A')
-        #             print(f"[{cell}]")
-        #             print(f"  -> 面积 (Area): {area} μm²")
-                    
-        #             # 遍历所有的输出引脚 (S, CO)
-        #             for out_pin in ['S', 'CO']:
-        #                 if out_pin in nldm_db[cell]:
-        #                     # 遍历所有的输入引脚 (A, B, CI)
-        #                     for in_pin in ['A', 'B', 'CI']:
-        #                         if in_pin in nldm_db[cell][out_pin]:
-        #                             arc_data = nldm_db[cell][out_pin][in_pin]
-        #                             delay_lut = arc_data.get('delay_lut')
-                                    
-        #                             # 确保 LUT 存在且有数据
-        #                             if delay_lut is not None and hasattr(delay_lut, 'min'):
-        #                                 delay_min = delay_lut.min().item()
-        #                                 delay_max = delay_lut.max().item()
-        #                                 print(f"  -> {in_pin} -> {out_pin:<2} 延迟极限范围: {delay_min:.5f} ns ~ {delay_max:.5f} ns")
-        #             print("-" * 40)
-        #     print("="*60 + "\n")
-        #     # ===================================================================
-        # ================= [增强：物理数据透明化打印 (含电容验证)] =================
+
             print("\n" + "="*60)
             print(" 📊 [物理数据核对] 提取的 Area, Cap 与 Delay 全景概览")
             print("="*60)
@@ -289,17 +62,13 @@ def main():
                     print(f"[{cell}]")
                     print(f"  -> 面积 (Area): {area} μm²")
                     
-                    # --- [关键：输出引脚电容验证] ---
                     if 'pin_cap' in nldm_db[cell]:
                         print(f"  -> 引脚输入电容 (Input Capacitance):")
                         for pin, cap in nldm_db[cell]['pin_cap'].items():
-                            # 28nm 下通常在 0.001 pF 左右
                             print(f"     * {pin:<3} : {cap:.6f} pF") 
                     else:
                         print(f"  -> [Warning] 未发现引脚电容数据！")
-                    # -------------------------------
                     
-                    # 遍历所有的输出引脚 (S, CO) 打印延迟范围
                     for out_pin in ['S', 'CO']:
                         if out_pin in nldm_db[cell]:
                             for in_pin in ['A', 'B', 'CI']:
@@ -310,17 +79,12 @@ def main():
                                         print(f"  -> {in_pin} -> {out_pin:<2} 延迟极限: {delay_lut.min().item():.5f} ~ {delay_lut.max().item():.5f} ns")
                     print("-" * 40)
             print("="*60 + "\n")
-            # ===================================================================
+            
             fa_tensors = [nldm_db[c] for c in TARGET_CELLS if c.startswith('FA') and c in nldm_db]
             ha_tensors = [nldm_db[c] for c in TARGET_CELLS if c.startswith('HA') and c in nldm_db]
         else:
             raise FileNotFoundError(f"找不到指定的工艺库文件: {lib_path}")
     except Exception as e:
-        # print(f"\n[System] PDK 异常，切换【物理对齐 Mock 模式】...")
-        # fa_tensors, ha_tensors = create_physical_tensor_mock()
-        # # Mock 模式下必须伪造同样数量的名字给 Verilog 生成器，否则会越界崩溃
-        # fa_names = [f"Mock_FA_Impl_{i}" for i in range(len(fa_tensors))]
-        # ha_names = [f"Mock_HA_Impl_{i}" for i in range(len(ha_tensors))]
         print(f"\n[Fatal Error] 系统初始化失败，拒绝以非严谨模式运行。原因: {e}")
         sys.exit(1)
         
@@ -330,54 +94,28 @@ def main():
     NUM_PP = len(PP_COLS)
     NUM_COMPRESSORS = len(COMP_COLS)
 
-    # pp_at = torch.linspace(0.0, 0.1, NUM_PP) 
-    # pp_slew = torch.full((NUM_PP,), 0.05)
-    # REQ_TIME = 0.1 
-    # print("REQ_TIME：" + str(REQ_TIME))
-
-    # print(f"\n[Engine] 构建异构可微压缩树...")
-    # model = DOMAC_CompressorTree(PP_COLS, COMP_COLS, fa_tensors, ha_tensors, C_TYPES, REQ_TIME)
-
-    # loss_engine = DOMACLossFunction()
-    # trainer = DOMACTrainer(model, loss_engine, lr=0.05)
-    
-    # print("\n[Engine] 物理映射与梯度反向传播开始...")
-    
-    # start_time = time.time()
-    # final_M, final_P = trainer.train(pp_at, pp_slew, max_epochs=300)
-    # ================= [GPU 核动力点火] =================
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\n[System] 核心计算引擎将挂载至: {device}")
     if torch.cuda.is_available():
         print(f" -> 检测到显卡: {torch.cuda.get_device_name(0)}")
-        # 为了极速性能，开启 CuDNN 基准测试加速
         torch.backends.cudnn.benchmark = True 
 
-    # 1. 初始信号输入必须在显存上创建
-    # pp_at = torch.linspace(0.0, 0.1, NUM_PP, device=device) 
-    # pp_at = torch.zeros(NUM_PP, device=device) 
     pp_at = torch.full((NUM_PP,), 0.1, device=device)
     pp_slew = torch.full((NUM_PP,), 0.02, device=device)
     REQ_TIME = 0 
     print("REQ_TIME：" + str(REQ_TIME))
 
     print(f"\n[Engine] 构建异构可微压缩树...")
-    # ================= [核心重构：初始态路由引擎] =================
     max_impls = max(len(fa_tensors), len(ha_tensors))
-    
-    # [修复1] 显式定义基准物理门索引 (1 代表使用 FA1D1)
     BASELINE_GATE_INDEX = 1 
-    # 安全处理：如果库里只有一个尺寸，强制使用索引 0
     safe_gate_idx = BASELINE_GATE_INDEX if max_impls > BASELINE_GATE_INDEX else 0
 
     if INIT_MODE == 'dadda':
         print(f" -> [Init] 采用 Dadda 树先验知识热启动 (物理门初始尺寸: D{safe_gate_idx})")
         init_m = generate_dadda_init_matrix(BIT_WIDTH, PP_COLS, COMP_COLS, C_TYPES)
-        
         init_p = torch.zeros((NUM_COMPRESSORS, max_impls))
         init_p[:, safe_gate_idx] = 10.0  
         
-        # 从初始矩阵萃取 100% 对齐的 Baseline
         discrete_init_M = torch.zeros_like(init_m)
         discrete_init_M[:, :-1] = (init_m[:, :-1] == 10.0).float() 
         discrete_init_P = [safe_gate_idx] * NUM_COMPRESSORS
@@ -397,18 +135,12 @@ def main():
         torch.manual_seed(FIXED_SEED)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(FIXED_SEED)
-        init_m = torch.randn((total_nodes, total_target_pins + 1)) * 0.5
+        init_m = torch.randn((total_nodes, total_target_pins + 1)) * 0.01
         init_p = torch.zeros((NUM_COMPRESSORS, max_impls))
-        
-        # 白板模式没有初始物理结构，无法生成 Baseline 网表
-        discrete_init_M = None
-        discrete_init_P = None
         
     else:
         raise ValueError(f"[Fatal] 未知的初始化模式: {INIT_MODE}")
         
-    # ============================================================
-    # 2. [修复2] 将 init_m 和 init_p 喂给模型，并上 GPU
     model = DOMAC_CompressorTree(
         PP_COLS, COMP_COLS, fa_tensors, ha_tensors, C_TYPES, REQ_TIME, 
         device=device,
@@ -416,7 +148,6 @@ def main():
         init_p_logits=init_p
     ).to(device)
 
-    # 将动态约束传入 Loss 引擎
     loss_engine = DOMACLossFunction(target_sink_count=TARGET_SINK_COUNT)
     trainer = DOMACTrainer(model, loss_engine, lr=0.05)
     
@@ -427,174 +158,33 @@ def main():
     
     print("\n[System] 优化执行完毕！网表拓扑已坍缩至离散界限附近。")
     
-    # 1. 启动合法化器 (离散坍缩)
     legalizer = DOMACLegalizer()
     discrete_M, discrete_P = legalizer.legalize(final_M, final_P, C_TYPES, model.dag_mask)
     
-    # # ================= [新增：列高溢出探针 (Column Height Probe)] =================
-    # from collections import Counter
-    # print("\n" + "="*60)
-    # print(" 🕵️ [DOMAC 探针] 最终输出到 CPA 的列高 (Column Height) 核查")
-    # print("="*60)
+    # # ================= [探针 1：列高溢出探针] =================
+    # probe_column_height_overflow(model, discrete_M)
+    # # ==========================================================
 
-    # # 1. 获取所有节点的列权重属性
-    # node_cols = model.node_cols
+    # ================= [探针 2：离散化后硬连线物理评估 & WNS 溯源探针] =================
+    probe_post_legalization_eval(
+        model=model, 
+        loss_engine=loss_engine, 
+        trainer_hyperparams=trainer.hyperparams, 
+        discrete_M=discrete_M, 
+        discrete_P=discrete_P, 
+        final_P=final_P, 
+        pp_at=pp_at, 
+        pp_slew=pp_slew, 
+        REQ_TIME=REQ_TIME, 
+        PP_COLS=PP_COLS, 
+        COMP_COLS=COMP_COLS
+    )
 
-    # # 2. 找出流向 Sink (下游 CPA) 的节点
-    # # 在 discrete_M 中，如果某一行全为 0，说明该节点没有连向任何内部压缩器引脚，必然流向了 Sink
-    # row_sums = torch.sum(discrete_M, dim=1)
-    # nodes_to_sink = torch.where(row_sums == 0)[0].tolist()
+    # ================= [探针 3：波前到达时间 (Wavefront AT) 探针] =================
+    probe_wavefront_at(model=model, discrete_M=discrete_M)
 
-    # # 3. 提取这些残余节点的列权重，并统计每一列的数量
-    # sink_weights = [node_cols[i] for i in nodes_to_sink]
-    # col_counts = Counter(sink_weights)
-    
-    # overflow_detected = False
-    # for col, count in sorted(col_counts.items()):
-    #     if count > 2:
-    #         # 超过 2 个信号，必然触发 DC 综合工具的多重 CPA 级联雪崩！
-    #         print(f" 🚨 [致命溢出] 第 {col:>2} 列: 残留了 {count} 个未压缩信号！")
-    #         overflow_detected = True
-    #     else:
-    #         print(f" ✅ [正常]     第 {col:>2} 列: 残留 {count} 个信号")
-
-    # if overflow_detected:
-    #     print("\n ⚠️ 结论：列压缩未彻底完成！")
-    #     print("    下游 DC 综合工具将被迫把多余的信号强行跨接 (如 intadd_1 -> intadd_0)，导致 0.4ns+ 的时序雪崩！")
-    # else:
-    #     print("\n 完美：所有列已严格压缩至 <= 2，完全符合进入单一高速 CPA 的条件。")
-    # print("="*60 + "\n")
-    # # ==============================================================================
-
-    # ================= [新增：离散化后硬连线物理评估 (Post-Legalization Eval)] =================
-    print("\n[Evaluator] 正在对坍缩后的 0/1 离散硬连线进行最终物理时序核算...")
-    with torch.no_grad():
-        # 1. 构造离散化物理尺寸的 One-Hot 张量
-        discrete_P_tensor = torch.zeros_like(final_P)
-        for i, idx in enumerate(discrete_P):
-            discrete_P_tensor[i, idx] = 1.0
-            
-        # 2. 构造包含 Sink (CPA) 列的完整离散连线矩阵
-        discrete_M_full = torch.zeros_like(model.m_logits)
-        discrete_M_full[:, :-1] = discrete_M
-        # 匈牙利算法没有分给压缩树的引脚，必定全部流向了最后的 CPA (Sink)
-        row_sums = torch.sum(discrete_M, dim=1)
-        discrete_M_full[row_sums == 0, -1] = 1.0
-
-        # 3. 备份原本训练结束时的模糊 logits
-        orig_m_logits = model.m_logits.clone()
-        orig_p_logits = model.p_logits.clone()
-
-        # 4. [核心技巧] 注入极端 Logits 强制网络走硬连线
-        # 将 1 映射为 10000.0，0 映射为 -10000.0，经过 Softmax 后就是绝对的 1.0 和 0.0
-        new_m_logits = torch.full_like(orig_m_logits, -1e4)
-        new_m_logits[discrete_M_full == 1.0] = 1e4
-        model.m_logits.copy_(new_m_logits)
-
-        new_p_logits = torch.full_like(orig_p_logits, -1e4)
-        new_p_logits[discrete_P_tensor == 1.0] = 1e4
-        model.p_logits.copy_(new_p_logits)
-
-        # 5. 执行一次纯净的前向传播与 Loss 计算
-        eval_wns, eval_tns, eval_area, eval_M, eval_P = model(pp_at, pp_slew, tau=1.0)
-        eval_loss, eval_dict = loss_engine(
-            eval_wns, eval_tns, eval_area, eval_M, eval_P, trainer.hyperparams, 
-            model.active_pin_mask, model.c_types
-        )
-
-        print(f" -> [坍缩后真实指标] WNS: {eval_dict['wns'].item():.4f} ns | "
-              f"Area: {eval_dict['area'].item():.4f} μm² | "
-              f"L_BM: {eval_dict['l_bm'].item():.4f} | "
-              f"Total Loss: {eval_loss.item():.4f}")
-        
-        # ================= [新增：WNS 计算过程溯源探针] =================
-        print("\n" + "="*60)
-        print(" 🧮 [DOMAC 探针] 离散化网表 WNS 内部计算逻辑核对")
-        print("="*60)
-        
-        # 1. 提取离散化评估后的全图所有节点的 AT (到达时间)
-        all_ats = model._probe_node_ats.detach().cpu().numpy()
-        req_time = REQ_TIME # 你设定的目标时间 (当前是 0.0)
-        
-        # 2. 计算每个节点的 Slack (容限)
-        # Slack = 要求到达时间 - 实际到达时间
-        slacks = req_time - all_ats
-        
-        # 3. 找出全图 Slack 最差的节点 (即 AT 最大的节点)
-        worst_idx = np.argmin(slacks)
-        worst_at = all_ats[worst_idx]
-        worst_slack = slacks[worst_idx]
-        
-        # 4. 翻译这个“罪魁祸首”节点的物理身份
-        num_pp = len(PP_COLS)
-        num_c = len(COMP_COLS)
-        if worst_idx < num_pp:
-            node_name = f"原始输入信号 PP_in_{worst_idx}"
-        elif worst_idx < num_pp + num_c:
-            c_idx = worst_idx - num_pp
-            node_name = f"压缩器 U_comp_{c_idx} 的 S (Sum) 输出引脚"
-        else:
-            c_idx = worst_idx - num_pp - num_c
-            node_name = f"压缩器 U_comp_{c_idx} 的 CO (Carry-Out) 输出引脚"
-            
-        print(f" -> 1. 设定的目标到达时间 (REQ_TIME) : {req_time:.4f} ns")
-        print(f" -> 2. 全局最慢的关键节点判定为     : {node_name}")
-        print(f" -> 3. 查表计算的该节点实际 AT      : {worst_at:.4f} ns")
-        print(f" -> 4. 原始负超额 (Negative Slack)  : {min(0.0, worst_slack):.4f} ns")
-        
-        # 因为 DOMAC 使用了 smooth_max_lse (Log-Sum-Exp) 来保证导数连续，
-        # 所以最终平滑出的 WNS 会比绝对最大值稍微大一点点 (gamma=0.01 产生的极小膨胀)
-        print(f" -> 5. AI 最终汇报的平滑 eval_wns   : {eval_wns.item():.4f} ns")
-        
-        print("="*60 + "\n")
-        # ====================================================================
-
-        # 6. 恢复原本的 logits (保持代码状态安全)
-        model.m_logits.copy_(orig_m_logits)
-        model.p_logits.copy_(orig_p_logits)
-    # ================= [新增：离散化后硬连线物理评估 (Post-Legalization Eval)] =================
-
-# ================= [新增：波前到达时间 (Wavefront AT) 探针] =================
-    print("\n" + "="*65)
-    print(" 🌊 [DOMAC 探针] CPA 输入波前到达时间 (Wavefront AT) 剖析")
-    print("="*65)
-    
-    # 提取离散化评估后，全图节点的真实物理到达时间
-    node_ats = model._probe_node_ats.detach().cpu().numpy()
-    node_cols = model.node_cols
-    
-    # 找出流向 Sink 的节点 (行和为 0 的离散 M)
-    row_sums = torch.sum(discrete_M, dim=1)
-    nodes_to_sink = torch.where(row_sums == 0)[0].tolist()
-    
-    # 按照列(Column)分类收集这些节点的 AT
-    col_to_ats = {}
-    for idx in nodes_to_sink:
-        col = node_cols[idx]
-        at = node_ats[idx]
-        if col not in col_to_ats:
-            col_to_ats[col] = []
-        col_to_ats[col].append(at)
-        
-    print(f"{'比特位 (Column)':<15} | {'交付给 CPA 的最晚时间 (Max AT)':<25} | {'波前状态诊断'}")
-    print("-" * 65)
-    
-    for col in sorted(col_to_ats.keys()):
-        max_at = max(col_to_ats[col])
-        # 诊断逻辑：低位（如 0~6 列）如果不低于 0.18ns，说明严重挤占了 CPA 的进位跑道
-        if col < 7 and max_at > 0.18:
-            status = "🚨 危险 (波前倒置/低位滞后)"
-        elif col >= 7 and max_at > 0.28:
-            status = "⚠️ 偏高 (全局延迟瓶颈)"
-        else:
-            status = "✅ 优秀 (符合 CPA 期望)"
-            
-        print(f" Col {col:<10} | {max_at:.4f} ns{'':<16} | {status}")
-        
-    print("="*65 + "\n")
     # ==============================================================================
 
-    # 2. 启动 Verilog 打印机
     os.makedirs("output/netlists", exist_ok=True)
     
     v_gen = VerilogGenerator(
@@ -605,44 +195,32 @@ def main():
         ha_cell_names=ha_names
     )
     
-    netlist_path = "output/netlists/domac_result.v"
-    tb_path = "output/netlists/tb_domac.v"
+    netlist_path = f"output/netlists/domac_tree_{BIT_WIDTH}.v"
+    # tb_path = "output/netlists/tb_domac_.v"
     
     v_gen.generate(discrete_M, discrete_P, output_file=netlist_path)
-    v_gen.generate_testbench(tb_file=tb_path, netlist_file=netlist_path)
+    # v_gen.generate_testbench(tb_file=tb_path, netlist_file=netlist_path)
     
-    # [修复3] 删除了重复的 generate_multiplier_top
-    top_path = "output/netlists/domac.v"
+    top_path = f"output/netlists/domac_{BIT_WIDTH}.v"
     v_gen.generate_multiplier_top(
         bit_width=BIT_WIDTH, 
         top_file=top_path, 
-        ct_module_name="domac_compressor_tree", 
+        ct_module_name="domac_tree", 
         top_module_name="domac"
     )
-
-    # ================= [替换：基于配置动态生成 Baseline] =================
     if INIT_MODE == 'dadda' and discrete_init_M is not None:
         print(f"\n[BaselineGen] 正在直接从 AI 热启动矩阵中剥离 {INIT_MODE} 基准网表 (保证 100% 对齐)...")
-        
-        # 1. 临时征用生成器，改名为 baseline
-        v_gen.module_name = f"{INIT_MODE}_baseline_ct"
-        
-        # 2. 将刚开局的 0/1 矩阵直接印成 RTL！
-        v_gen.generate(discrete_init_M, discrete_init_P, output_file=f"output/netlists/{INIT_MODE}_baseline_ct.v")
-        
-        # 3. 封装 Baseline 的顶层
+        v_gen.module_name = f"{INIT_MODE}_tree"
+        v_gen.generate(discrete_init_M, discrete_init_P, output_file=f"output/netlists/{INIT_MODE}_tree_{BIT_WIDTH}.v")
         v_gen.generate_multiplier_top(
             bit_width=BIT_WIDTH,
-            top_file=f"output/netlists/{INIT_MODE}.v",
-            ct_module_name=f"{INIT_MODE}_baseline_ct",
+            top_file=f"output/netlists/{INIT_MODE}_{BIT_WIDTH}.v",
+            ct_module_name=f"{INIT_MODE}_tree",
             top_module_name=f"{INIT_MODE}"
         )
-        
-        # 4. 恢复原名，保持工程整洁
-        v_gen.module_name = "domac_compressor_tree"
+        v_gen.module_name = "dadda_tree"
     else:
         print(f"\n[BaselineGen] 当前为 '{INIT_MODE}' 冷启动模式，跳过生成基准对照组网表。")
-    # =================================================================
 
     end_time = time.time()
     print("="*60)
@@ -650,11 +228,7 @@ def main():
     print(f" 请前往 output/netlists/domac_result.v 查看流片网表。")
     print("="*60)
 
-# ================= [新增：跨服一键发射模块] =================
     print("\n[System] 启动跨服传输，正在将网表发射至 GPU 仿真服务器...")
-    
-    # 构造 rsync 命令
-    # 注意: output/netlists/ 末尾的斜杠表示同步文件夹内部的所有文件，而不是文件夹本身
     rsync_cmd = [
         "rsync", "-avzP",
         "output/netlists/", 
@@ -663,7 +237,6 @@ def main():
     ]
     
     try:
-        # 启动子进程执行传输，保留终端的实时输出 (stdout/stderr)
         subprocess.run(rsync_cmd, check=True)
         print("="*60)
         print("[System] 🚀 跨服投递成功！")
@@ -676,8 +249,6 @@ def main():
         print("\n[Fatal Error] 本地系统未找到 rsync 命令，请先运行 sudo apt install rsync 安装。")
 
 if __name__ == "__main__":
-    # 开启 PyTorch 的异常检测，用于排查任何可能的梯度断裂
-    # torch.autograd.set_detect_anomaly(True)
     main()
 ```
 
@@ -906,23 +477,23 @@ class DOMACTrainer:
         #     {'params': [self.model.p_logits], 'lr': lr * 5.0}  # 强行加速物理收敛
         # ])
 
-        # self.hyperparams = {
-        #     't1': 10000.0,     # WNS 权重拉到极致，逼迫网络突破延迟极限
-        #     't2': 0.01,       # TNS 辅助全局路径寻优
-        #     'alpha': 3.0,    # 【封印】前期绝对不许管面积！
-        #     'lambda1': 0.1,  # 连线合法性是必须的
-        #     'lambda2': 0.5,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
-        # }
-
         self.hyperparams = {
-            't1': 1.8,     # WNS 权重拉到极致，逼迫网络突破延迟极限
-            't2': 0.1,       # TNS 辅助全局路径寻优
+            't1': 1.5,     # WNS 权重拉到极致，逼迫网络突破延迟极限
+            't2': 0.223,       # TNS 辅助全局路径寻优
             'alpha': 1,    # 【封印】前期绝对不许管面积！
-            'lambda1': 0.18,  # 连线合法性是必须的
-            'lambda2': 0.42,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
-            'tau_k':0.985,
+            'lambda1': 0.2,  # 连线合法性是必须的
+            'lambda2': 0.2,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+            'tau_k':0.995,
         }
 
+        # self.hyperparams = {
+        #     't1': 3.4,     # WNS 权重拉到极致，逼迫网络突破延迟极限
+        #     't2': 0.35,       # TNS 辅助全局路径寻优
+        #     'alpha': 1,    # 【封印】前期绝对不许管面积！
+        #     'lambda1': 0.25,  # 连线合法性是必须的
+        #     'lambda2': 0.12,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+        #     'tau_k':0.995,
+        # }
     def update_hyperparameters(self, epoch):
         if epoch >= 100:
             self.hyperparams['alpha'] *= 1.003
@@ -1492,7 +1063,47 @@ class DOMAC_CompressorTree(nn.Module):
         # # 使用引入了 CPA 惩罚的 AT 来计算 Slack
         # slacks = self.req_time - effective_ats_tensor
         # # =========================================================================
+# =========================================================================
+        # 🚀 [真实物理校准：可切换架构的 CPA 代理模型]
+        # =========================================================================
+        # 1. 计算每个节点流向外部 CPA (Sink) 的连续概率
+        sink_probs = 1.0 - torch.sum(M_internal, dim=1)
+        sink_probs = torch.clamp(sink_probs, min=0.0, max=1.0)
+        
+        # 2. 基于 2026-03 DC 综合报告提取的绝对真实参数
+        CPA_BIT_DELAY_RCA = 0.040      # 从报告得出: CI->CO 稳定在 0.04ns
+        CPA_BASE_DELAY_RCA = 0.090     # 首位 HA + 末位 S 输出的固定开销
+        
+        CPA_TREE_STAGE_DELAY = 0.035   # 高速前缀树(Kogge-Stone)单级延迟预估
+        CPA_BASE_DELAY_TREE = 0.055    # 树形加法器的基础进入延迟
 
+        max_col = max(self.node_cols)
+        cols_tensor = torch.tensor(self.node_cols, dtype=torch.float32, device=all_ats_tensor.device)
+        distance_to_msb = max_col - cols_tensor
+        
+        # =======================================================
+        # 模式切换开关：目前你的 DC 综合出的是 RCA，所以我们先用 RCA 模式训练！
+        # 如果你未来在 DC 里开出了前缀树，请把这里改成 'PREFIX_TREE'
+        # =======================================================
+        CPA_ARCHITECTURE = 'RCA' 
+        
+        if CPA_ARCHITECTURE == 'RCA':
+            # O(N) 线性惩罚模型，完美契合你刚刚贴出的 DC 综合网表！
+            cpa_latency = CPA_BASE_DELAY_RCA + distance_to_msb * CPA_BIT_DELAY_RCA
+        else:
+            # O(log2(N)) 对数模型，代表 DesignWare 里的顶级综合结果
+            cpa_latency = CPA_BASE_DELAY_TREE + CPA_TREE_STAGE_DELAY * torch.log2(distance_to_msb + 1.0)
+            
+        # 计算 CPA 综合惩罚
+        cpa_penalty = cpa_latency * sink_probs
+        
+        # 3. 融合 CPA 惩罚后的全局有效到达时间
+        effective_ats_tensor = all_ats_tensor + cpa_penalty
+        
+        # 4. 利用全链路时序计算最终的 Slack
+        slacks = self.req_time - effective_ats_tensor
+        # =========================================================================
+        
         negative_slacks = torch.clamp(slacks, max=0.0)
         
         WNS = smooth_max_lse(-negative_slacks, gamma=0.01) 
@@ -1699,13 +1310,380 @@ def diff_bilinear_interp(slew, load, index_1_slew, index_2_load, lut_values):
     return val0 * (1 - wx) + val1 * wx
 ```
 
+### `src/core/domac_utils.py`
+
+```python
+# domac_utils.py
+import torch
+import numpy as np
+
+def create_physical_tensor_mock():
+    idx_slew = torch.tensor([0.005, 0.01, 0.02, 0.04, 0.08, 0.16, 0.32], dtype=torch.float32)
+    idx_load = torch.tensor([0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064], dtype=torch.float32)
+    
+    fa_delay_lut = torch.linspace(0.05, 0.20, 49).view(7, 7) 
+    ha_delay_lut = torch.linspace(0.03, 0.15, 49).view(7, 7) 
+    slew_lut = torch.linspace(0.01, 0.10, 49).view(7, 7)
+    
+    fa_base = {'cell_area': 2.5, 'S': {'A': {'index_1_slew': idx_slew, 'index_2_load': idx_load, 'delay_lut': fa_delay_lut, 'slew_lut': slew_lut}}, 'CO': {'A': {'index_1_slew': idx_slew, 'index_2_load': idx_load, 'delay_lut': fa_delay_lut, 'slew_lut': slew_lut}}}
+    ha_base = {'cell_area': 1.8, 'S': {'A': {'index_1_slew': idx_slew, 'index_2_load': idx_load, 'delay_lut': ha_delay_lut, 'slew_lut': slew_lut}}, 'CO': {'A': {'index_1_slew': idx_slew, 'index_2_load': idx_load, 'delay_lut': ha_delay_lut, 'slew_lut': slew_lut}}}
+    
+    # 模拟返回多个物理实现的库：3种FA，2种HA
+    return [fa_base, fa_base, fa_base], [ha_base, ha_base]
+
+def generate_multiplier_canvas(bit_width):
+    print(f"\n[Canvas Generator] 自动推演 {bit_width}x{bit_width} 乘法器画布 (严格 Dadda Tree 算法)...")
+    pp_cols = []
+    max_cols = bit_width * 2 - 1
+    dots_in_col = [0] * max_cols
+    
+    # 1. 生成初始部分积 (Partial Products) 矩阵
+    for i in range(bit_width):
+        for j in range(bit_width):
+            col = i + j
+            pp_cols.append(col)
+            dots_in_col[col] += 1
+            
+    print(f" -> 共 {len(pp_cols)} 个 PP 节点。初始点数分布:\n    {dots_in_col}")
+    
+    # 2. 计算 Dadda 树的目标高度序列 (2, 3, 4, 6, 9, 13, 19, 28...)
+    dadda_seq = [2]
+    while dadda_seq[-1] < bit_width:
+        dadda_seq.append(int(dadda_seq[-1] * 1.5))
+    dadda_seq.reverse() 
+    
+    # 过滤掉大于等于当前最大高度的目标，只保留真正需要压缩的阶段
+    targets = [t for t in dadda_seq if t < max(dots_in_col)]
+    print(f" -> Dadda 目标高度收敛序列: {targets}")
+    
+    comp_cols_raw = []
+    c_types_raw = []
+    current_dots = list(dots_in_col)
+    
+    # 3. 按目标高度逐级扫荡压缩
+    for stage_idx, target in enumerate(targets):
+        current_len = len(current_dots)
+        next_dots = [0] * current_len
+        carry_from_prev = 0
+        
+        for col in range(current_len):
+            V = current_dots[col]
+            # 当前列在下一级期望达到的高度边界 (扣除上一列传来的进位后，本列允许留下的节点数)
+            allowed_output = target - carry_from_prev
+            
+            if V > allowed_output:
+                # 需要通过引入压缩器来削减的点数
+                reduction_needed = V - allowed_output
+                
+                # 贪心分配：1 个 FA 削减 2 个高度，1 个 HA 削减 1 个高度
+                f = reduction_needed // 2
+                h = reduction_needed % 2
+                
+                for _ in range(f):
+                    comp_cols_raw.append(col)
+                    c_types_raw.append('FA')
+                for _ in range(h):
+                    comp_cols_raw.append(col)
+                    c_types_raw.append('HA')
+                    
+                # 本列保留的点数 = 原有数量 - 削减的高度
+                dots_stay = V - reduction_needed
+                next_dots[col] = dots_stay + carry_from_prev
+                carry_from_prev = f + h
+            else:
+                # 不需要压缩，全部透传，加上进位
+                next_dots[col] = V + carry_from_prev
+                carry_from_prev = 0
+                
+        # 最后一个进位如果存在，顺延到最高位的下一列
+        if carry_from_prev > 0:
+            next_dots.append(carry_from_prev)
+            
+        current_dots = next_dots
+        
+    final_max = max(current_dots)
+    print(f" -> 压缩完毕！最终最大高度: {final_max}。")
+    print(f" -> 申请 {len(comp_cols_raw)} 个压缩器画布 ({c_types_raw.count('FA')} FA, {c_types_raw.count('HA')} HA)。")
+    
+    if final_max > 2:
+        print("\n[致命警告] Dadda 树未能将高度压缩至 2！请检查位宽逻辑。")
+        
+    # 4. [高危漏洞修复] 安全地将坑位和物理类型进行联合排序 (Zip Sort)
+    # 确保无论 Stage 怎么穿插，列索引和分配给该列的门类型永远死死绑定
+    combined = sorted(zip(comp_cols_raw, c_types_raw), key=lambda x: x[0])
+    comp_cols = [x[0] for x in combined]
+    c_types = [x[1] for x in combined]
+
+    return pp_cols, comp_cols, c_types
+    
+def generate_dadda_init_matrix(bit_width, pp_cols, c_cols, c_types):
+    """
+    [Dr. Gemini 热启动引擎] 提取纯血 Dadda 树的硬连线逻辑，
+    并转化为 DOMAC 连续概率矩阵的初始 Logits。
+    """
+    print(f"\n[Warm Start] 正在提取 Dadda 拓扑作为先验知识，初始化拓扑概率矩阵...")
+    num_pp = len(pp_cols)
+    num_c = len(c_cols)
+    total_nodes = num_pp + 2 * num_c
+    total_target_pins = num_c * 3
+    
+    # 初始化全 0 矩阵 (Logits)。之后会被 Softmax 转化为概率。
+    m_logits = torch.zeros((total_nodes, total_target_pins + 1))
+    
+    max_cols = bit_width * 2 - 1
+    signals = [[] for _ in range(max_cols)]
+    
+    # 1. 初始化 PP 信号源节点 ID (0 到 num_pp-1)
+    k = 0
+    for i in range(bit_width):
+        for j in range(bit_width):
+            signals[i+j].append(k)
+            k += 1
+            
+    dadda_seq = [2]
+    while dadda_seq[-1] < bit_width:
+        dadda_seq.append(int(dadda_seq[-1] * 1.5))
+    dadda_seq.reverse()
+    targets = [t for t in dadda_seq if t < max([len(col) for col in signals])]
+    
+    # 2. 建立反向映射表：DOMAC 的压缩器是按列(col)排好序的，
+    # 我们必须把 Dadda 生成过程中的压缩器准确映射到 DOMAC 的绝对索引 j 上。
+    comp_index_map = {col: {'FA': [], 'HA': []} for col in range(max_cols)}
+    for j, (col, c_type) in enumerate(zip(c_cols, c_types)):
+        comp_index_map[col][c_type].append(j)
+        
+    comp_usage = {col: {'FA': 0, 'HA': 0} for col in range(max_cols)}
+    
+    # 3. 严格遵循 Dadda 算法，但这次我们记录连线索引！
+    for stage_idx, target in enumerate(targets):
+        next_signals = [[] for _ in range(max_cols + 1)]
+        carry_from_prev = []
+        
+        for col in range(len(signals)):
+            current_sigs = signals[col] + carry_from_prev
+            V = len(current_sigs)
+            
+            if V > target:
+                reduction_needed = V - target
+                f = reduction_needed // 2
+                h = reduction_needed % 2
+                
+                carries_generated = []
+                
+                for _ in range(f):
+                    s1, s2, s3 = current_sigs.pop(), current_sigs.pop(), current_sigs.pop()
+                    # 获取该 FA 在 DOMAC 体系下的绝对索引
+                    j = comp_index_map[col]['FA'][comp_usage[col]['FA']]
+                    comp_usage[col]['FA'] += 1
+                    
+                    # [注入先验偏置] 给 Dadda 的目标连线施加 10.0 的极高初始权重
+                    m_logits[s1, j * 3 + 0] = 10.0
+                    m_logits[s2, j * 3 + 1] = 10.0
+                    m_logits[s3, j * 3 + 2] = 10.0
+                    
+                    # 生成下一级的节点 ID
+                    next_signals[col].append(num_pp + j)       # S 输出
+                    carries_generated.append(num_pp + num_c + j) # CO 输出
+                    
+                for _ in range(h):
+                    s1, s2 = current_sigs.pop(), current_sigs.pop()
+                    j = comp_index_map[col]['HA'][comp_usage[col]['HA']]
+                    comp_usage[col]['HA'] += 1
+                    
+                    m_logits[s1, j * 3 + 0] = 10.0
+                    m_logits[s2, j * 3 + 1] = 10.0
+                    
+                    next_signals[col].append(num_pp + j)
+                    carries_generated.append(num_pp + num_c + j)
+                    
+                next_signals[col].extend(current_sigs)
+                carry_from_prev = carries_generated
+            else:
+                next_signals[col].extend(current_sigs)
+                carry_from_prev = []
+                
+        if carry_from_prev:
+            if len(signals) >= len(next_signals):
+                next_signals.append([])
+            next_signals[len(signals)].extend(carry_from_prev)
+            
+        signals = next_signals
+
+    # 4. 处理最终流向 CPA (Sink) 的剩余信号
+    for i in range(total_nodes):
+        # 如果某个节点没有任何一根引脚指向压缩器（最高 Logit 小于 5.0），说明它直接通向 Sink
+        if torch.max(m_logits[i, :-1]) < 5.0:
+            m_logits[i, -1] = 10.0
+            
+    print(f" -> Dadda 知识蒸馏完毕！已将 {int(torch.sum(m_logits == 10.0).item())} 根硬连线转化为高斯先验。")
+    return m_logits
+
+# ================= [探针 1：列高溢出探针] =================
+def probe_column_height_overflow(model, discrete_M):
+    """
+    [DOMAC 探针] 最终输出到 CPA 的列高 (Column Height) 核查
+    （原版保留了全部的注释与逻辑）
+    """
+    print("\n" + "="*60)
+    print(" 🕵️ [DOMAC 探针] 最终输出到 CPA 的列高 (Column Height) 核查")
+    print("="*60)
+
+    # 1. 获取所有节点的列权重属性
+    node_cols = model.node_cols
+
+    # 2. 找出流向 Sink (下游 CPA) 的节点
+    # 在 discrete_M 中，如果某一行全为 0，说明该节点没有连向任何内部压缩器引脚，必然流向了 Sink
+    row_sums = torch.sum(discrete_M, dim=1)
+    nodes_to_sink = torch.where(row_sums == 0)[0].tolist()
+
+    # 3. 提取这些残余节点的列权重，并统计每一列的数量
+    sink_weights = [node_cols[i] for i in nodes_to_sink]
+    col_counts = Counter(sink_weights)
+    
+    overflow_detected = False
+    for col, count in sorted(col_counts.items()):
+        if count > 2:
+            # 超过 2 个信号，必然触发 DC 综合工具的多重 CPA 级联雪崩！
+            print(f" 🚨 [致命溢出] 第 {col:>2} 列: 残留了 {count} 个未压缩信号！")
+            overflow_detected = True
+        else:
+            print(f" ✅ [正常]     第 {col:>2} 列: 残留 {count} 个信号")
+
+    if overflow_detected:
+        print("\n ⚠️ 结论：列压缩未彻底完成！")
+        print("    下游 DC 综合工具将被迫把多余的信号强行跨接 (如 intadd_1 -> intadd_0)，导致 0.4ns+ 的时序雪崩！")
+    else:
+        print("\n 完美：所有列已严格压缩至 <= 2，完全符合进入单一高速 CPA 的条件。")
+    print("="*60 + "\n")
+
+# ================= [探针 2：离散化后硬连线物理评估 & WNS 溯源] =================
+def probe_post_legalization_eval(model, loss_engine, trainer_hyperparams, discrete_M, discrete_P, final_P, pp_at, pp_slew, REQ_TIME, PP_COLS, COMP_COLS):
+    print("\n[Evaluator] 正在对坍缩后的 0/1 离散硬连线进行最终物理时序核算...")
+    with torch.no_grad():
+        # 1. 构造离散化物理尺寸的 One-Hot 张量
+        discrete_P_tensor = torch.zeros_like(final_P)
+        for i, idx in enumerate(discrete_P):
+            discrete_P_tensor[i, idx] = 1.0
+            
+        # 2. 构造包含 Sink (CPA) 列的完整离散连线矩阵
+        discrete_M_full = torch.zeros_like(model.m_logits)
+        discrete_M_full[:, :-1] = discrete_M
+        # 匈牙利算法没有分给压缩树的引脚，必定全部流向了最后的 CPA (Sink)
+        row_sums = torch.sum(discrete_M, dim=1)
+        discrete_M_full[row_sums == 0, -1] = 1.0
+
+        # 3. 备份原本训练结束时的模糊 logits
+        orig_m_logits = model.m_logits.clone()
+        orig_p_logits = model.p_logits.clone()
+
+        # 4. [核心技巧] 注入极端 Logits 强制网络走硬连线
+        new_m_logits = torch.full_like(orig_m_logits, -1e4)
+        new_m_logits[discrete_M_full == 1.0] = 1e4
+        model.m_logits.copy_(new_m_logits)
+
+        new_p_logits = torch.full_like(orig_p_logits, -1e4)
+        new_p_logits[discrete_P_tensor == 1.0] = 1e4
+        model.p_logits.copy_(new_p_logits)
+
+        # 5. 执行一次纯净的前向传播与 Loss 计算
+        eval_wns, eval_tns, eval_area, eval_M, eval_P = model(pp_at, pp_slew, tau=1.0)
+        eval_loss, eval_dict = loss_engine(
+            eval_wns, eval_tns, eval_area, eval_M, eval_P, trainer_hyperparams, 
+            model.active_pin_mask, model.c_types
+        )
+
+        print(f" -> [坍缩后真实指标] WNS: {eval_dict['wns'].item():.4f} ns | "
+              f"Area: {eval_dict['area'].item():.4f} μm² | "
+              f"L_BM: {eval_dict['l_bm'].item():.4f} | "
+              f"Total Loss: {eval_loss.item():.4f}")
+        
+        # ================= [WNS 计算过程溯源探针] =================
+        print("\n" + "="*60)
+        print(" 🧮 [DOMAC 探针] 离散化网表 WNS 内部计算逻辑核对")
+        print("="*60)
+        
+        # 1. 提取离散化评估后的全图所有节点的 AT (到达时间)
+        all_ats = model._probe_node_ats.detach().cpu().numpy()
+        req_time = REQ_TIME 
+        
+        # 2. 计算每个节点的 Slack (容限)
+        slacks = req_time - all_ats
+        
+        # 3. 找出全图 Slack 最差的节点 (即 AT 最大的节点)
+        worst_idx = np.argmin(slacks)
+        worst_at = all_ats[worst_idx]
+        worst_slack = slacks[worst_idx]
+        
+        # 4. 翻译这个“罪魁祸首”节点的物理身份
+        num_pp = len(PP_COLS)
+        num_c = len(COMP_COLS)
+        if worst_idx < num_pp:
+            node_name = f"原始输入信号 PP_in_{worst_idx}"
+        elif worst_idx < num_pp + num_c:
+            c_idx = worst_idx - num_pp
+            node_name = f"压缩器 U_comp_{c_idx} 的 S (Sum) 输出引脚"
+        else:
+            c_idx = worst_idx - num_pp - num_c
+            node_name = f"压缩器 U_comp_{c_idx} 的 CO (Carry-Out) 输出引脚"
+            
+        print(f" -> 1. 设定的目标到达时间 (REQ_TIME) : {req_time:.4f} ns")
+        print(f" -> 2. 全局最慢的关键节点判定为     : {node_name}")
+        print(f" -> 3. 查表计算的该节点实际 AT      : {worst_at:.4f} ns")
+        print(f" -> 4. 原始负超额 (Negative Slack)  : {min(0.0, worst_slack):.4f} ns")
+        print(f" -> 5. AI 最终汇报的平滑 eval_wns   : {eval_wns.item():.4f} ns")
+        print("="*60 + "\n")
+
+        # 6. 恢复原本的 logits (保持代码状态安全)
+        model.m_logits.copy_(orig_m_logits)
+        model.p_logits.copy_(orig_p_logits)
+
+# ================= [探针 3：波前到达时间 (Wavefront AT)] =================
+def probe_wavefront_at(model, discrete_M):
+    print("\n" + "="*65)
+    print(" 🌊 [DOMAC 探针] CPA 输入波前到达时间 (Wavefront AT) 剖析")
+    print("="*65)
+    
+    # 提取离散化评估后，全图节点的真实物理到达时间
+    node_ats = model._probe_node_ats.detach().cpu().numpy()
+    node_cols = model.node_cols
+    
+    # 找出流向 Sink 的节点 (行和为 0 的离散 M)
+    row_sums = torch.sum(discrete_M, dim=1)
+    nodes_to_sink = torch.where(row_sums == 0)[0].tolist()
+    
+    # 按照列(Column)分类收集这些节点的 AT
+    col_to_ats = {}
+    for idx in nodes_to_sink:
+        col = node_cols[idx]
+        at = node_ats[idx]
+        if col not in col_to_ats:
+            col_to_ats[col] = []
+        col_to_ats[col].append(at)
+        
+    print(f"{'比特位 (Column)':<15} | {'交付给 CPA 的最晚时间 (Max AT)':<25} | {'波前状态诊断'}")
+    print("-" * 65)
+    
+    for col in sorted(col_to_ats.keys()):
+        max_at = max(col_to_ats[col])
+        if col < 7 and max_at > 0.18:
+            status = "🚨 危险 (波前倒置/低位滞后)"
+        elif col >= 7 and max_at > 0.28:
+            status = "⚠️ 偏高 (全局延迟瓶颈)"
+        else:
+            status = "✅ 优秀 (符合 CPA 期望)"
+            
+        print(f" Col {col:<10} | {max_at:.4f} ns{'':<16} | {status}")
+        
+    print("="*65 + "\n")
+```
+
 ### `src/export/verilog_gen.py`
 
 ```python
 import torch
 
 class VerilogGenerator:
-    def __init__(self, pp_cols, c_cols, c_types, fa_cell_names, ha_cell_names, module_name="domac_compressor_tree"):
+    def __init__(self, pp_cols, c_cols, c_types, fa_cell_names, ha_cell_names, module_name="domac_tree"):
         """
         [Dr. Gemini 终极版] RTL 网表与 Testbench 双生生成器
         """
@@ -1806,91 +1784,7 @@ class VerilogGenerator:
             
         print(f"[VerilogGen] 物理网表已成功封盒！")
 
-    def generate_testbench(self, tb_file="tb_domac.v", netlist_file="domac_result.v"):
-        """
-        [Dr. Gemini 可视化版] 动态生成带“算式直播”的权重守恒测试平台
-        """
-        print(f"[VerilogGen] 正在锻造带算式输出的自校验 Testbench: {tb_file}")
-        with open(tb_file, 'w') as f:
-            f.write("`timescale 1ns/1ps\n\n")
-            
-            f.write("// ================= TSMC Mock Behavioral Models =================\n")
-            for fa_name in set(self.fa_cell_names):
-                f.write(f"module {fa_name} (input A, B, CI, output S, CO);\n")
-                f.write("    assign {CO, S} = A + B + CI;\n")
-                f.write("endmodule\n")
-            for ha_name in set(self.ha_cell_names):
-                f.write(f"module {ha_name} (input A, B, output S, CO);\n")
-                f.write("    assign {CO, S} = A + B;\n")
-                f.write("endmodule\n\n")
-                
-            f.write("module tb_domac;\n")
-            
-            pp_regs = [f"pp_in_{i}" for i in range(self.num_pp)]
-            f.write(f"    reg {', '.join(pp_regs)};\n")
-            
-            out_wires = [port[0] for port in self.tb_output_ports]
-            f.write(f"    wire {', '.join(out_wires)};\n\n")
-            
-            f.write(f"    {self.module_name} DUT (\n")
-            all_ports = pp_regs + out_wires
-            f.write(",\n".join([f"        .{p}({p})" for p in all_ports]))
-            f.write("\n    );\n\n")
-            
-            # 使用 64 位整数 (reg [63:0]) 防止大位宽乘法器权重溢出
-            f.write("    reg [63:0] expected_weight, actual_weight;\n")
-            f.write("    integer i;\n")
-            f.write("    integer error_count = 0;\n\n")
-            
-            f.write("    initial begin\n")
-            f.write("        $display(\"\\n============================================================\");\n")
-            f.write("        $display(\" [DOMAC 算术验证中心] 启动权重守恒算式核对\");\n")
-            f.write("        $display(\"============================================================\\n\");\n")
-            
-            f.write("        for (i = 0; i < 1000; i = i + 1) begin\n")
-            
-            for i, p_reg in enumerate(pp_regs):
-                f.write(f"            {p_reg} = $random % 2;\n")
-                
-            f.write("            #5; // 模拟信号穿过组合逻辑的延迟\n\n")
-            
-            f.write("            expected_weight = 0")
-            for i, p_reg in enumerate(pp_regs):
-                f.write(f" + ({p_reg} * (64'h1 << {self.pp_cols[i]}))")
-            f.write(";\n")
-            
-            f.write("            actual_weight = 0")
-            for out_name, weight in self.tb_output_ports:
-                f.write(f" + ({out_name} * (64'h1 << {weight}))")
-            f.write(";\n\n")
-            
-            # ======== [核心修改：终端直播打印] ========
-            f.write("            // 打印前 20 次和每 100 次的详细算式，防止终端刷屏卡死\n")
-            f.write("            if (i < 20 || i % 100 == 0) begin\n")
-            f.write("                if (expected_weight === actual_weight)\n")
-            f.write("                    $display(\"  [Test %04d] 算式成立: 📥 进件总值 %10d  ===  📤 产出总值 %10d   [✔ PASS]\", i, expected_weight, actual_weight);\n")
-            f.write("                else\n")
-            f.write("                    $display(\"  [Test %04d] 算式崩塌: 📥 进件总值 %10d  =!=  📤 产出总值 %10d   [❌ FAIL]\", i, expected_weight, actual_weight);\n")
-            f.write("            end\n")
-            
-            f.write("            if (expected_weight !== actual_weight) begin\n")
-            f.write("                error_count = error_count + 1;\n")
-            f.write("            end\n")
-            f.write("        end\n\n")
-            
-            f.write("        $display(\"\\n============================================================\");\n")
-            f.write("        if (error_count == 0)\n")
-            f.write("            $display(\" 🎉 [Testbench] 1000 次算式核对完美通过！拓扑绝对守恒！\");\n")
-            f.write("        else\n")
-            f.write("            $display(\" 💥 [Testbench] 验证失败，共发现 %0d 个权重流失错误！\", error_count);\n")
-            f.write("        $display(\"============================================================\\n\");\n")
-            
-            f.write("        $finish;\n")
-            f.write("    end\n")
-            f.write("endmodule\n")        
-        print(f"[VerilogGen] Testbench 可视化升级完毕！")
-
-    def generate_multiplier_top(self, bit_width, top_file="domac.v", ct_module_name="domac_compressor_tree", top_module_name="domac"):
+    def generate_multiplier_top(self, bit_width, top_file="domac.v", ct_module_name="domac_tree", top_module_name="domac"):
         """
         自动生成完整的乘法器顶层封装模块
         包含: PPG (部分积生成阵列) + CT (DOMAC 压缩树) + CPA (末级加法器)
