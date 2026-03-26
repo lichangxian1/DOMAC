@@ -360,4 +360,31 @@ class DOMAC_CompressorTree(nn.Module):
         self._probe_node_ats = all_ats_tensor.detach()
         # ====================================================
 
-        return WNS, TNS, expected_area, M_internal, P_c
+        # =========================================================================
+        # ⚡ [新增核弹级特性：全图可微毛刺功耗探针 (Glitch Power Profiler)]
+        # =========================================================================
+        # 1. 将铺平的引脚 AT 张量 reshape 为 [压缩器数量, 引脚数(3)]
+        pin_ats_reshaped = pin_ats_all.view(self.num_c, self.num_pins_per_c)
+        mask_reshaped = self.active_pin_mask.view(self.num_c, self.num_pins_per_c)
+        
+        # 2. 计算每个压缩器有效引脚的数量 (FA为3, HA为2)
+        valid_pin_count = torch.sum(mask_reshaped, dim=1, keepdim=True)
+        
+        # 3. 计算每个压缩器的局部中心到达时间 (Mean AT)
+        mean_ats = torch.sum(pin_ats_reshaped * mask_reshaped, dim=1, keepdim=True) / valid_pin_count
+        
+        # 4. 计算到达时间方差 (Variance) 
+        glitch_variance = torch.sum(mask_reshaped * (pin_ats_reshaped - mean_ats)**2, dim=1)
+        
+        # 5. [核心优化] 转化为标准差 (Standard Deviation)，拉升数值量级！
+        # ⚠️ 必须加上 1e-8 防止完美平衡时 torch.sqrt(0) 导致梯度爆炸产生 NaN！
+        glitch_std = torch.sqrt(glitch_variance + 1e-8)
+        
+        # 6. 全图总毛刺代价 (标准差之和)
+        expected_glitch = torch.sum(glitch_std)
+        # =========================================================================
+        
+        # 在 return 列表中加上 expected_glitch
+        return WNS, TNS, expected_area, expected_glitch, M_internal, P_c
+    
+        # return WNS, TNS, expected_area, M_internal, P_c

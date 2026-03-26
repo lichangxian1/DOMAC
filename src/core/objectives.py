@@ -14,12 +14,19 @@ class DOMACLossFunction(nn.Module):
         self.target_sink_count = target_sink_count
         self.pin_counts = torch.tensor(pin_counts_lib, dtype=torch.float32)
 
-    def calc_performance_loss(self, wns, tns, area, t1, t2, alpha):
+    # def calc_performance_loss(self, wns, tns, area, t1, t2, alpha):
+    #     """
+    #     1. 性能驱动损失 (Performance Objective)
+    #     """
+    #     return t1 * wns + t2 * tns + alpha * area
+    # def calc_performance_loss(self, wns, tns, area, t1, t2, alpha):
+    def calc_performance_loss(self, wns, tns, area, glitch, t1, t2, alpha, beta):
         """
         1. 性能驱动损失 (Performance Objective)
+        引入 beta * glitch 来惩罚到达时间的不平衡，从物理底层消灭毛刺功耗。
         """
-        return t1 * wns + t2 * tns + alpha * area
-
+        return t1 * wns + t2 * tns + alpha * area + beta * glitch
+    
     # def calc_bijective_mapping_loss(self, M_internal, P_c):
     #     """
     #     2. Pin-Level 双射映射约束 (Bijective Mapping Loss L_BM)
@@ -82,22 +89,21 @@ class DOMACLossFunction(nn.Module):
         l_sink = (excess_signals ** 2) * 100.0
         return l_sink, total_sink_signals
 
-    # def forward(self, wns, tns, area, M, P_c, hyperparams):
-    def forward(self, wns, tns, area, M, P_c, hyperparams, active_pin_mask, c_types):    
+    def forward(self, wns, tns, area, glitch, M, P_c, hyperparams, active_pin_mask, c_types):    
         """
         联合损失计算引擎
         """
         t1 = hyperparams['t1']
         t2 = hyperparams['t2']
         alpha = hyperparams['alpha']
+        beta = hyperparams.get('beta', 0.0) # 新增：提取毛刺功耗权重 (使用 get 防错)
         lambda1 = hyperparams['lambda1']
         lambda2 = hyperparams['lambda2']
         
-        # 1. 性能 Loss
-        l_perf = self.calc_performance_loss(wns, tns, area, t1, t2, alpha)
+        # 1. 性能 Loss (现在包含了功耗维度)
+        l_perf = self.calc_performance_loss(wns, tns, area, glitch, t1, t2, alpha, beta)
         
         # 2. 合法拓扑 Loss
-        # l_bm = self.calc_bijective_mapping_loss(M, P_c)
         l_bm = self.calc_bijective_mapping_loss(M, P_c, active_pin_mask, c_types)
 
         # 3. 离散化 Loss 
@@ -106,7 +112,6 @@ class DOMACLossFunction(nn.Module):
         l_d = l_d_M + l_d_P
         
         # 4. Sink 惩罚 Loss
-        # 我们希望最终整个乘法器这列最多只留 2 个信号给底部的加法器
         l_sink, actual_sink_count = self.calc_sink_loss(M, target_max_signals=self.target_sink_count)
         
         # 5. 总 Loss 融合
@@ -124,7 +129,8 @@ class DOMACLossFunction(nn.Module):
             'actual_sink_count': actual_sink_count,
             'wns': wns,
             'tns': tns,
-            'area': area
+            'area': area,
+            'glitch': glitch  # 新增：记录到日志，方便在训练时观察毛刺是否在下降
         }
         
         return total_loss, loss_dict

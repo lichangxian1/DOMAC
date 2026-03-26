@@ -28,7 +28,7 @@ def main():
     print(" [DOMAC 净室复现] TSMC 28nm 节点可微 STA 优化框架")
     print("="*60)
     
-    INIT_MODE = 'dadda'
+    INIT_MODE = 'blank'  # 可选 'dadda' 或 'blank'，分别对应 Dadda 热启动和纯随机冷启动
     
     # TARGET_CELLS = [
     #     'FA1D0BWP12T40P140',
@@ -81,7 +81,7 @@ def main():
         print(f"\n[Fatal Error] 系统初始化失败，拒绝以非严谨模式运行。原因: {e}")
         sys.exit(1)
         
-    BIT_WIDTH = 16
+    BIT_WIDTH = 8
     TARGET_SINK_COUNT = (BIT_WIDTH * 2 - 1) * 2
     PP_COLS, COMP_COLS, C_TYPES = generate_multiplier_canvas(BIT_WIDTH)
     NUM_PP = len(PP_COLS)

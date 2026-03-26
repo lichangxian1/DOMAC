@@ -18,14 +18,15 @@ class DOMACTrainer:
         # ])
 
         self.hyperparams = {
-            't1': 1.5,     # WNS 权重拉到极致，逼迫网络突破延迟极限
-            't2': 0.223,       # TNS 辅助全局路径寻优
+            't1': 2.7,     # WNS 权重拉到极致，逼迫网络突破延迟极限
+            't2': 0.3,       # TNS 辅助全局路径寻优
             'alpha': 1,    # 【封印】前期绝对不许管面积！
-            'lambda1': 0.2,  # 连线合法性是必须的
-            'lambda2': 0.2,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+            'lambda1': 0.25,  # 连线合法性是必须的
+            'lambda2': 0.3,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
             'tau_k':0.995,
+            'beta': 0.001103510833,     # 新增：毛刺功耗权重，适度关注毛刺下降但不至于过早牺牲性能
         }
-
+        
         # self.hyperparams = {
         #     't1': 3.4,     # WNS 权重拉到极致，逼迫网络突破延迟极限
         #     't2': 0.35,       # TNS 辅助全局路径寻优
@@ -33,7 +34,9 @@ class DOMACTrainer:
         #     'lambda1': 0.25,  # 连线合法性是必须的
         #     'lambda2': 0.12,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
         #     'tau_k':0.995,
+        #     'beta': 100,     # 新增：毛刺功耗权重，适度关注毛刺下降但不至于过早牺牲性能
         # }
+ 
     def update_hyperparameters(self, epoch):
         if epoch >= 100:
             self.hyperparams['alpha'] *= 1.003
@@ -41,7 +44,7 @@ class DOMACTrainer:
             self.hyperparams['t2'] *= 1.005
             self.hyperparams['lambda1'] *= 1.01
             self.hyperparams['lambda2'] *= 1.01
-
+            self.hyperparams['beta'] *= 1.05
     # def update_hyperparameters(self, epoch):
     #     """
     #     动态退火调度器：分阶段释放约束
@@ -102,7 +105,7 @@ class DOMACTrainer:
             # ================= [探针 1: 前向传播 STA] =================
             t0 = time.time()
             # wns, tns, area, M, P_c = self.model(pp_at, pp_slew)
-            wns, tns, area, M, P_c = self.model(pp_at, pp_slew, tau=current_tau)
+            wns, tns, area, glitch, M, P_c = self.model(pp_at, pp_slew, tau=current_tau)
             t1 = time.time()
             acc_forward += (t1 - t0)
             
@@ -111,7 +114,7 @@ class DOMACTrainer:
             
             # ================= [探针 2: 目标与约束 Loss 计算] =================
             total_loss, loss_dict = self.loss_engine(
-                wns, tns, area, M, P_c, self.hyperparams, 
+                wns, tns, area,glitch, M, P_c, self.hyperparams, 
                 active_pin_mask, c_types
             )
             t2 = time.time()
@@ -139,6 +142,7 @@ class DOMACTrainer:
                 print(f"\nEpoch {epoch:03d} | "
                       f"WNS: {loss_dict['wns'].item():.4f} | "
                       f"Area: {loss_dict['area'].item():.4f} | "
+                      f"Glitch: {loss_dict['glitch'].item():.4f} | " # <--- 【新增监控】
                       f"L_BM: {loss_dict['l_bm'].item():.4f} | "
                       f"Total Loss: {total_loss.item():.4f}")
                 

@@ -1,2 +1,4 @@
 output
-domac_optuna.db
+*.db
+src/core/__pycache__
+src/optimizer/__pycache__/

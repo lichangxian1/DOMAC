@@ -243,7 +243,7 @@ def probe_column_height_overflow(model, discrete_M):
 
 # ================= [探针 2：离散化后硬连线物理评估 & WNS 溯源] =================
 def probe_post_legalization_eval(model, loss_engine, trainer_hyperparams, discrete_M, discrete_P, final_P, pp_at, pp_slew, REQ_TIME, PP_COLS, COMP_COLS):
-    print("\n[Evaluator] 正在对坍缩后的 0/1 离散硬连线进行最终物理时序核算...")
+    print("\n[Evaluator] 正在对坍缩后的 0/1 离散硬连线进行最终物理时序与毛刺功耗核算...")
     with torch.no_grad():
         # 1. 构造离散化物理尺寸的 One-Hot 张量
         discrete_P_tensor = torch.zeros_like(final_P)
@@ -271,14 +271,19 @@ def probe_post_legalization_eval(model, loss_engine, trainer_hyperparams, discre
         model.p_logits.copy_(new_p_logits)
 
         # 5. 执行一次纯净的前向传播与 Loss 计算
-        eval_wns, eval_tns, eval_area, eval_M, eval_P = model(pp_at, pp_slew, tau=1.0)
+        # 【修改点 1】增加 eval_glitch 接收毛刺功耗方差
+        eval_wns, eval_tns, eval_area, eval_glitch, eval_M, eval_P = model(pp_at, pp_slew, tau=1.0)
+        
+        # 【修改点 2】将 eval_glitch 传给 loss_engine
         eval_loss, eval_dict = loss_engine(
-            eval_wns, eval_tns, eval_area, eval_M, eval_P, trainer_hyperparams, 
+            eval_wns, eval_tns, eval_area, eval_glitch, eval_M, eval_P, trainer_hyperparams, 
             model.active_pin_mask, model.c_types
         )
 
+        # 【修改点 3】在最终评估报告中打印出 Glitch 的数值
         print(f" -> [坍缩后真实指标] WNS: {eval_dict['wns'].item():.4f} ns | "
               f"Area: {eval_dict['area'].item():.4f} μm² | "
+              f"Glitch (Var): {eval_dict['glitch'].item():.6f} | "
               f"L_BM: {eval_dict['l_bm'].item():.4f} | "
               f"Total Loss: {eval_loss.item():.4f}")
         

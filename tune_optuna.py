@@ -71,22 +71,24 @@ def evaluate_discrete_physical_metrics(model, loss_engine, hyperparams, discrete
         new_p_logits[discrete_P_tensor == 1.0] = 1e4
         model.p_logits.copy_(new_p_logits)
 
-        true_wns, true_tns, true_area, M_internal, P_c = model(pp_at, pp_slew, tau=1.0)
-        _, loss_dict = loss_engine(true_wns, true_tns, true_area, M_internal, P_c, hyperparams, active_pin_mask, c_types)
+        # 【修复点 1】: 增加 true_glitch 接收模型输出
+        true_wns, true_tns, true_area, true_glitch, M_internal, P_c = model(pp_at, pp_slew, tau=1.0)
+        # 【修复点 2】: 将 true_glitch 传入 Loss 引擎
+        _, loss_dict = loss_engine(true_wns, true_tns, true_area, true_glitch, M_internal, P_c, hyperparams, active_pin_mask, c_types)
         
         model.m_logits.copy_(orig_m_logits)
         model.p_logits.copy_(orig_p_logits)
         model.dag_mask.copy_(orig_dag_mask)
         
-        return true_wns.item(), true_area.item(), loss_dict['l_bm'].item()
+        # 【修复点 3】: 将毛刺功耗一起返回
+        return true_wns.item(), true_area.item(), true_glitch.item(), loss_dict['l_bm'].item()
 
 # ================= [核心重构：多进程独立 Worker] =================
-def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_cols, comp_cols, c_types, bit_width, progress_queue, num_trials):
+# 【修改点 4】: 在函数签名中接收 target_weights 目标权重字典
+def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_cols, comp_cols, c_types, bit_width, progress_queue, num_trials, target_weights):
     """
-    这个函数会运行在你原版的 ProcessPoolExecutor 的独立进程中！
-    独享 GIL，独享 CUDA 线程，再也不会卡顿！
+    独立进程 Worker：独享 GIL 和 CUDA
     """
-    # 强制单线程运算防止内部抢占
     torch.set_num_threads(1)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if torch.cuda.is_available():
@@ -99,36 +101,36 @@ def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_co
     total_nodes = num_pp + 2 * len(comp_cols)
     total_target_pins = len(comp_cols) * 3
 
-    # 在独立的进程里，加载我们那个共享的 SQLite 数据库
-    study = optuna.load_study(study_name=study_name, storage=storage_url)
+    # study = optuna.load_study(study_name=study_name, storage=storage_url)
+    # 增加数据库写入超时时间至 60 秒，防止高频剪枝导致锁死
+    storage = optuna.storages.RDBStorage(
+        url=storage_url,
+        engine_kwargs={"connect_args": {"timeout": 60}}
+    )
+    study = optuna.load_study(study_name=study_name, storage=storage)
 
     def objective(trial):
         param_combination = {
-            't1': trial.suggest_float('t1', 1, 4, step=0.1),       
-            't2': trial.suggest_float('t2', 0.05, 0.4),  
-            'lambda1': trial.suggest_float('lambda1', 0.15, 0.25, step=0.01), 
-            'lambda2': trial.suggest_float('lambda2', 0.1, 0.6, step=0.02),
-            'tau_k':trial.suggest_float('tau_k', 0.97, 0.995, step=0.001),
-            # [新增] 拓扑初始化的随机种子，搜索空间设为 0 到 1000
+            't1': trial.suggest_float('t1', 1, 4, step=0.05),       
+            't2': trial.suggest_float('t2', 0.05, 0.5 ,step=0.05),  
+            'lambda1': trial.suggest_float('lambda1', 0.02, 0.7, step=0.02), 
+            'lambda2': trial.suggest_float('lambda2', 0.02, 0.7, step=0.02),
+            'tau_k':trial.suggest_float('tau_k', 0.98, 0.995, step=0.005),
             'seed': 42,
-            #trial.suggest_int('seed', 0, 100),
-            'max_epochs':trial.suggest_int('max_epochs', 200, 400),
-            # [新增] 高斯噪声的权重，使用对数分布 (从 0.001 到 0.1)
-            'init_noise_std': trial.suggest_float('init_noise_std', 0.001, 0.1, log=True)
+            'max_epochs':300,
+            'init_noise_std': 0.01,
+            'beta':trial.suggest_float('beta', 0.001, 0.5)  # 新增：毛刺功耗权重，适度关注毛刺下降但不至于过早牺牲性能
         }
         
-# 2. 从字典中提取并应用动态随机种子
         FIXED_SEED = param_combination['seed']
         torch.manual_seed(FIXED_SEED)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(FIXED_SEED)
 
-        # 3. 动态应用高斯分布权重来打破拓扑对称性
         noise_std = param_combination['init_noise_std']
         init_m_cpu = torch.randn((total_nodes, total_target_pins + 1)) * noise_std
         init_m = init_m_cpu.to(device)
         
-        # 物理选择概率矩阵依然保持全零初始化，因为门类型的选择不需要打破对称性
         init_p_cpu = torch.zeros((len(comp_cols), max_impls))
         init_p = init_p_cpu.to(device)
         
@@ -138,7 +140,6 @@ def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_co
         def epoch_callback_fn(epoch, current_wns):
             nonlocal completed_epochs
             
-            # 恢复原汁原味：每个 Epoch 都推送，保证 UI 极致丝滑！
             STEP = 1
             progress_queue.put(STEP)
             completed_epochs += STEP
@@ -148,7 +149,7 @@ def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_co
                 
             progress_queue.put({'WNS_探针': f"{current_wns:.4f}ns (T{trial.number})"})
             
-            # SQLite 的 Report 极快，直接每轮汇报即可
+            # 使用目前的 WNS 作为过程剪枝指标依然是最可靠的
             trial.report(current_wns, epoch)
             if trial.should_prune():
                 raise optuna.TrialPruned()
@@ -172,19 +173,19 @@ def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_co
                 legalizer = DOMACLegalizer()
                 discrete_M, discrete_P = legalizer.legalize(final_M, final_P, c_types, model.dag_mask)
                 
-                true_wns, true_area, final_l_bm = evaluate_discrete_physical_metrics(
+                # 【修改点 5】: 接收 true_glitch
+                true_wns, true_area, true_glitch, final_l_bm = evaluate_discrete_physical_metrics(
                     model, loss_engine, trainer.hyperparams, discrete_M, discrete_P, pp_at, pp_slew, c_types, model.active_pin_mask
                 )
                 
                 if final_l_bm >= 0.5:
-                    return 9.99
+                    return 999.0 # 给非法网络施加毁灭性惩罚
                     
             except optuna.TrialPruned:
                 raise
             except Exception as e:
-                return 9.99
+                return 999.0
             finally:
-                # 完美填补剪枝跳过的进度条
                 rem_epochs = MAX_EPOCHS - completed_epochs
                 if rem_epochs > 0:
                     progress_queue.put(rem_epochs)
@@ -195,16 +196,42 @@ def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_co
                 torch.cuda.empty_cache()
                 gc.collect()
 
-        return true_wns + (true_area * 0.0001)
+        # =========================================================================
+        # 👑 【核心修改点 6】: 基于用户自定义权重的线性组合目标函数
+        # =========================================================================
+        final_score = (
+            target_weights.get('wns', 1.0) * true_wns +
+            target_weights.get('area', 0.0) * true_area +
+            target_weights.get('glitch', 0.0) * true_glitch
+        )
+        return final_score
 
-    # 关键：在这个独立的进程里，跑它分到的份额！
     study.optimize(objective, n_trials=num_trials)
 
 
 def main():
     print("="*70)
-    print(" 🧠 [DOMAC Master] Optuna + 纯血多进程并发搜索引擎")
+    print(" 🧠 [DOMAC Master] Optuna + 多维目标融合搜索雷达")
     print("="*70)
+    
+    # =========================================================================
+    # 🎯 【全新控制台】在此定义你想要优化的目标（任意线性组合）
+    # =========================================================================
+    # 案例 1: 纯时序极限突破 (WNS 唯一目标)
+    # TARGET_WEIGHTS = {'wns': 1.0, 'area': 0.0, 'glitch': 0.0}
+    
+    # 案例 2: PPA 综合考量 (时序为主，极其轻微的面积惩罚防止无脑堆大门)
+    # TARGET_WEIGHTS = {'wns': 1.0, 'area': 0.0001, 'glitch': 0.0}
+    
+    # 案例 3: 功耗-时序双雄博弈 (压制毛刺方差的同时保住时序)
+    # 注意: Glitch (方差) 数值极小 (0.0001~0.01级别)，因此需要给它 10.0 ~ 100.0 的高权重才能与 WNS(0.7ns级别) 抗衡
+    TARGET_WEIGHTS = {
+        'wns': 0, 
+        'area': 0.0000, 
+        'glitch': 1.0 
+    }
+    
+    print(f" [Target] 当前优化目标权重: WNS({TARGET_WEIGHTS.get('wns', 0)}), Area({TARGET_WEIGHTS.get('area', 0)}), Glitch({TARGET_WEIGHTS.get('glitch', 0)})")
     
     with HiddenPrints():
         TARGET_CELLS = ['FA1D0BWP12T40P140', 'HA1D0BWP12T40P140','FA1D1BWP12T40P140', 'HA1D1BWP12T40P140','FA1D2BWP12T40P140', 'HA1D2BWP12T40P140','FA1D4BWP12T40P140', 'HA1D4BWP12T40P140']
@@ -217,28 +244,24 @@ def main():
         pp_cols, comp_cols, c_types = generate_multiplier_canvas(BIT_WIDTH)
 
     TOTAL_TRIALS = 500
-    CONCURRENT_WORKERS = 8
+    CONCURRENT_WORKERS = 6
     
-    # 计算每个 Worker 负责多少个 Trial
     trials_per_worker = [TOTAL_TRIALS // CONCURRENT_WORKERS + (1 if x < TOTAL_TRIALS % CONCURRENT_WORKERS else 0) for x in range(CONCURRENT_WORKERS)]
 
-    # ================= [准备 Optuna 共享数据库] =================
     storage_url = f"sqlite:///domac_optuna_{BIT_WIDTH}bit.db"
     study_name = f"domac_tuning_{BIT_WIDTH}bit"
         
-    pruner = optuna.pruners.MedianPruner(n_warmup_steps=50, n_startup_trials=5)
+    pruner = optuna.pruners.MedianPruner(n_warmup_steps=200, n_startup_trials=50)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-    # Master 进程先创建好骨架
     study = optuna.create_study(
         study_name=study_name,
         storage=storage_url, 
         direction="minimize", 
         pruner=pruner,
-        load_if_exists=True  # 核心：如果库已经存在，就加入进去一起跑！
+        load_if_exists=True
     )
 
-    # ================= [启动全局队列与监听线程] =================
     manager = mp.Manager()
     progress_queue = manager.Queue()
     total_global_epochs = TOTAL_TRIALS * 300 
@@ -247,46 +270,42 @@ def main():
     listener_thread.daemon = True
     listener_thread.start()
     
-    # ================= [召唤原版 ProcessPoolExecutor] =================
-    # 彻底告别 Optuna 的幽灵线程锁，回到最纯正的进程池并发！
     with ProcessPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
         futures = []
         for n_trials in trials_per_worker:
+            # 【修改点 7】: 将 TARGET_WEIGHTS 安全地传递给子进程 Worker
             future = executor.submit(
                 optuna_worker_process, 
-                storage_url, study_name, fa_tensors, ha_tensors, pp_cols, comp_cols, c_types, BIT_WIDTH, progress_queue, n_trials
+                storage_url, study_name, fa_tensors, ha_tensors, pp_cols, comp_cols, c_types, BIT_WIDTH, progress_queue, n_trials, TARGET_WEIGHTS
             )
             futures.append(future)
             
         for future in as_completed(futures):
-            # 捕获可能出现的任何子进程崩溃
             future.result() 
 
-    # 结束监听
     progress_queue.put("DONE")
     listener_thread.join()
 
-    # ================= [输出终极战报] =================
     print("\n\n" + "="*70)
     print(" 🏆 [Auto-Tuner] 贝叶斯寻优结束！最终战报")
     print("="*70)
     
-    # 重新从数据库拉取最终结果
     study = optuna.load_study(study_name=study_name, storage=storage_url)
     
     pruned_trials = study.get_trials(deepcopy=False, states=[TrialState.PRUNED])
     complete_trials = study.get_trials(deepcopy=False, states=[TrialState.COMPLETE])
 
     print(f" -> 总共发起的试验次数: {len(study.trials)}")
-    print(f" -> 被智能剪枝节约的次数: {len(pruned_trials)} (极其可观的算力节省！)")
+    print(f" -> 被智能剪枝节约的次数: {len(pruned_trials)}")
     print(f" -> 完整跑完收敛的次数: {len(complete_trials)}")
     
-    best_trial = study.best_trial
-    print(f"\n🎯 [全局最强天选参数]")
-    print(f" -> 🏆 突破极限 WNS (含面积惩罚): {best_trial.value:.4f} ns")
-    print(" -> 最佳超参数组合:")
-    for key, value in best_trial.params.items():
-        print(f"    * {key}: {value}")
+    if len(complete_trials) > 0:
+        best_trial = study.best_trial
+        print(f"\n🎯 [全局最强天选参数]")
+        print(f" -> 🏆 突破极限综合得分 (WNS/Area/Glitch 加权和): {best_trial.value:.6f}")
+        print(" -> 最佳超参数组合:")
+        for key, value in best_trial.params.items():
+            print(f"    * {key}: {value}")
 
     df = study.trials_dataframe()
     os.makedirs("output", exist_ok=True)
