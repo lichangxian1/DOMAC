@@ -107,21 +107,43 @@ def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_co
         url=storage_url,
         engine_kwargs={"connect_args": {"timeout": 60}}
     )
-    study = optuna.load_study(study_name=study_name, storage=storage)
+    # study = optuna.load_study(study_name=study_name, storage=storage)
+    # 【修复点】强制给 Worker 进程也戴上 NopPruner 的紧箍咒！
+    study = optuna.load_study(
+        study_name=study_name, 
+        storage=storage,
+        pruner=optuna.pruners.NopPruner()  # <--- 加上这个参数
+    )
 
     def objective(trial):
+        # param_combination = {
+        #     't1': trial.suggest_float('t1', 1, 4, step=0.05),       
+        #     't2': trial.suggest_float('t2', 0.05, 0.5 ,step=0.05),  
+        #     'lambda1': trial.suggest_float('lambda1', 0.02, 0.7, step=0.02), 
+        #     'lambda2': trial.suggest_float('lambda2', 0.02, 0.7, step=0.02),
+        #     'tau_k':0.995,
+        #     'seed': 42,
+        #     'max_epochs':300,
+        #     'init_noise_std': 0.01,
+        #     'beta':trial.suggest_float('beta', 0.0001,0.01)  # 新增：毛刺功耗权重，适度关注毛刺下降但不至于过早牺牲性能
+        #     # 【新增】把学习率交给贝叶斯寻优，搜索区间 0.01 到 0.1
+        #     'lr': trial.suggest_float('lr', 0.01, 0.1, log=True)
+        # }
+        
         param_combination = {
-            't1': trial.suggest_float('t1', 1, 4, step=0.05),       
-            't2': trial.suggest_float('t2', 0.05, 0.5 ,step=0.05),  
-            'lambda1': trial.suggest_float('lambda1', 0.02, 0.7, step=0.02), 
-            'lambda2': trial.suggest_float('lambda2', 0.02, 0.7, step=0.02),
-            'tau_k':trial.suggest_float('tau_k', 0.98, 0.995, step=0.005),
+            't1': 1.5,     # WNS 权重拉到极致，逼迫网络突破延迟极限
+            't2': 0.223,       # TNS 辅助全局路径寻优
+            'alpha': 1,    # 【封印】前期绝对不许管面积！
+            'lambda1': 0.2,  # 连线合法性是必须的
+            'lambda2': 0.2,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+            'tau_k':0.995,
             'seed': 42,
             'max_epochs':300,
             'init_noise_std': 0.01,
-            'beta':trial.suggest_float('beta', 0.001, 0.5)  # 新增：毛刺功耗权重，适度关注毛刺下降但不至于过早牺牲性能
+            'beta': trial.suggest_float('beta', 0.0001,0.01),     # 新增：毛刺功耗权重，适度关注毛刺下降但不至于过早牺牲性能
+            'lr': trial.suggest_float('lr', 0.01, 0.1, log=True)
         }
-        
+
         FIXED_SEED = param_combination['seed']
         torch.manual_seed(FIXED_SEED)
         if torch.cuda.is_available():
@@ -162,7 +184,7 @@ def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_co
                 ).to(device)
 
                 loss_engine = DOMACLossFunction(target_sink_count=target_sink_count)
-                trainer = DOMACTrainer(model, loss_engine, lr=0.05)
+                trainer = DOMACTrainer(model, loss_engine, lr=param_combination['lr'])
                 trainer.hyperparams.update(param_combination)
 
                 pp_at = torch.full((num_pp,), 0.1, device=device)
@@ -251,7 +273,9 @@ def main():
     storage_url = f"sqlite:///domac_optuna_{BIT_WIDTH}bit.db"
     study_name = f"domac_tuning_{BIT_WIDTH}bit"
         
-    pruner = optuna.pruners.MedianPruner(n_warmup_steps=200, n_startup_trials=50)
+    # pruner = optuna.pruners.MedianPruner(n_warmup_steps=200, n_startup_trials=50)
+    # 不剪枝，让每个试验都跑满 300 Epoch，充分挖掘潜力（尤其是毛刺优化可能需要较长时间才能显现效果）
+    pruner = optuna.pruners.NopPruner()
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     study = optuna.create_study(

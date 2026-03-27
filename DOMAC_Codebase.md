@@ -35,7 +35,7 @@ def main():
     print(" [DOMAC 净室复现] TSMC 28nm 节点可微 STA 优化框架")
     print("="*60)
     
-    INIT_MODE = 'blank'
+    INIT_MODE = 'blank'  # 可选 'dadda' 或 'blank'，分别对应 Dadda 热启动和纯随机冷启动
     
     # TARGET_CELLS = [
     #     'FA1D0BWP12T40P140',
@@ -88,7 +88,7 @@ def main():
         print(f"\n[Fatal Error] 系统初始化失败，拒绝以非严谨模式运行。原因: {e}")
         sys.exit(1)
         
-    BIT_WIDTH = 8
+    BIT_WIDTH = 12
     TARGET_SINK_COUNT = (BIT_WIDTH * 2 - 1) * 2
     PP_COLS, COMP_COLS, C_TYPES = generate_multiplier_canvas(BIT_WIDTH)
     NUM_PP = len(PP_COLS)
@@ -478,14 +478,15 @@ class DOMACTrainer:
         # ])
 
         self.hyperparams = {
-            't1': 1.5,     # WNS 权重拉到极致，逼迫网络突破延迟极限
-            't2': 0.223,       # TNS 辅助全局路径寻优
+            't1': 1.45,     # WNS 权重拉到极致，逼迫网络突破延迟极限
+            't2': 0.4,       # TNS 辅助全局路径寻优
             'alpha': 1,    # 【封印】前期绝对不许管面积！
-            'lambda1': 0.2,  # 连线合法性是必须的
-            'lambda2': 0.2,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+            'lambda1': 0.66,  # 连线合法性是必须的
+            'lambda2': 0.24,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
             'tau_k':0.995,
+            'beta': 0.00125,     # 新增：毛刺功耗权重，适度关注毛刺下降但不至于过早牺牲性能
         }
-
+        
         # self.hyperparams = {
         #     't1': 3.4,     # WNS 权重拉到极致，逼迫网络突破延迟极限
         #     't2': 0.35,       # TNS 辅助全局路径寻优
@@ -493,7 +494,9 @@ class DOMACTrainer:
         #     'lambda1': 0.25,  # 连线合法性是必须的
         #     'lambda2': 0.12,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
         #     'tau_k':0.995,
+        #     'beta': 100,     # 新增：毛刺功耗权重，适度关注毛刺下降但不至于过早牺牲性能
         # }
+ 
     def update_hyperparameters(self, epoch):
         if epoch >= 100:
             self.hyperparams['alpha'] *= 1.003
@@ -501,7 +504,7 @@ class DOMACTrainer:
             self.hyperparams['t2'] *= 1.005
             self.hyperparams['lambda1'] *= 1.01
             self.hyperparams['lambda2'] *= 1.01
-
+            self.hyperparams['beta'] *= 1.05
     # def update_hyperparameters(self, epoch):
     #     """
     #     动态退火调度器：分阶段释放约束
@@ -562,7 +565,7 @@ class DOMACTrainer:
             # ================= [探针 1: 前向传播 STA] =================
             t0 = time.time()
             # wns, tns, area, M, P_c = self.model(pp_at, pp_slew)
-            wns, tns, area, M, P_c = self.model(pp_at, pp_slew, tau=current_tau)
+            wns, tns, area, glitch, M, P_c = self.model(pp_at, pp_slew, tau=current_tau)
             t1 = time.time()
             acc_forward += (t1 - t0)
             
@@ -571,7 +574,7 @@ class DOMACTrainer:
             
             # ================= [探针 2: 目标与约束 Loss 计算] =================
             total_loss, loss_dict = self.loss_engine(
-                wns, tns, area, M, P_c, self.hyperparams, 
+                wns, tns, area,glitch, M, P_c, self.hyperparams, 
                 active_pin_mask, c_types
             )
             t2 = time.time()
@@ -599,6 +602,7 @@ class DOMACTrainer:
                 print(f"\nEpoch {epoch:03d} | "
                       f"WNS: {loss_dict['wns'].item():.4f} | "
                       f"Area: {loss_dict['area'].item():.4f} | "
+                      f"Glitch: {loss_dict['glitch'].item():.4f} | " # <--- 【新增监控】
                       f"L_BM: {loss_dict['l_bm'].item():.4f} | "
                       f"Total Loss: {total_loss.item():.4f}")
                 
@@ -1063,7 +1067,7 @@ class DOMAC_CompressorTree(nn.Module):
         # # 使用引入了 CPA 惩罚的 AT 来计算 Slack
         # slacks = self.req_time - effective_ats_tensor
         # # =========================================================================
-# =========================================================================
+        # =========================================================================
         # 🚀 [真实物理校准：可切换架构的 CPA 代理模型]
         # =========================================================================
         # 1. 计算每个节点流向外部 CPA (Sink) 的连续概率
@@ -1104,6 +1108,56 @@ class DOMAC_CompressorTree(nn.Module):
         slacks = self.req_time - effective_ats_tensor
         # =========================================================================
         
+
+# # =========================================================================
+#         # 🚀 [真实物理校准：可切换架构的 CPA 代理模型 (DOMAC 28nm 精确版)]
+#         # =========================================================================
+#         # 1. 计算每个节点流向外部 CPA (Sink) 的连续概率
+#         # M_internal 形状为 [num_nodes, total_comp_pins]
+#         # 如果一个节点没有100%连接到压缩器，剩余的概率视作流向了底部的 CPA
+#         sink_probs = 1.0 - torch.sum(M_internal, dim=1)
+#         sink_probs = torch.clamp(sink_probs, min=0.0, max=1.0)
+        
+#         # 2. 基于 2026-03 DC 综合报告提取的绝对真实参数 (TSMC 28nm ZeroWireload)
+#         # --- 行波进位 (RCA) 模式 ---
+#         CPA_BIT_DELAY_RCA = 0.040      # 从报告得出: FA 的 CI->CO 稳定在 0.04ns
+#         CPA_BASE_DELAY_RCA = 0.100     # 注入端(A->CO 0.06ns) + 提取端(S+MUX 0.04ns) = 0.10ns
+        
+#         # --- 前缀树 (Prefix Tree) 模式 ---
+#         CPA_TREE_STAGE_DELAY = 0.035   # 高速前缀树(Kogge-Stone)单级复合门延迟预估
+#         CPA_BASE_DELAY_TREE = 0.060    # 树形加法器的基础进出延迟
+
+#         # 3. 计算到达 MSB 的物理距离 (决定了 Ripple Chain 的长度)
+#         # 乘法器的最终 MSB (Highest Bit) 取决于位宽
+#         max_col = max(self.node_cols) 
+#         cols_tensor = torch.tensor(self.node_cols, dtype=torch.float32, device=all_ats_tensor.device)
+        
+#         # 距离 = MSB - 当前节点所在列 (clamp 确保安全，防止负数和 log2(0))
+#         distance_to_msb = torch.clamp(max_col - cols_tensor, min=0.0)
+        
+#         # =======================================================
+#         # 模式切换开关：如果未来综合脚本开启了超级前缀树，改为 'PREFIX_TREE'
+#         # =======================================================
+#         CPA_ARCHITECTURE = 'RCA' 
+        
+#         if CPA_ARCHITECTURE == 'RCA':
+#             # O(N) 线性惩罚模型，完美契合目前网表生成的行波进位特征
+#             cpa_latency = CPA_BASE_DELAY_RCA + distance_to_msb * CPA_BIT_DELAY_RCA
+#         else:
+#             # O(log2(N)) 对数模型，代表 DesignWare 里的顶级综合结果
+#             cpa_latency = CPA_BASE_DELAY_TREE + CPA_TREE_STAGE_DELAY * torch.log2(distance_to_msb + 1.0)
+            
+#         # 4. 计算 CPA 综合惩罚 (软化处理)
+#         # 只有真正流向 Sink 的那部分概率，才会被施加 CPA 的长路径惩罚
+#         cpa_penalty = cpa_latency * sink_probs
+        
+#         # 5. 融合 CPA 惩罚后的全局有效到达时间 (Effective Arrival Time)
+#         effective_ats_tensor = all_ats_tensor + cpa_penalty
+        
+#         # 6. 利用全链路时序计算最终的 Slack
+#         slacks = self.req_time - effective_ats_tensor
+#         # =========================================================================
+        
         negative_slacks = torch.clamp(slacks, max=0.0)
         
         WNS = smooth_max_lse(-negative_slacks, gamma=0.01) 
@@ -1115,7 +1169,34 @@ class DOMAC_CompressorTree(nn.Module):
         self._probe_node_ats = all_ats_tensor.detach()
         # ====================================================
 
-        return WNS, TNS, expected_area, M_internal, P_c
+        # =========================================================================
+        # ⚡ [新增核弹级特性：全图可微毛刺功耗探针 (Glitch Power Profiler)]
+        # =========================================================================
+        # 1. 将铺平的引脚 AT 张量 reshape 为 [压缩器数量, 引脚数(3)]
+        pin_ats_reshaped = pin_ats_all.view(self.num_c, self.num_pins_per_c)
+        mask_reshaped = self.active_pin_mask.view(self.num_c, self.num_pins_per_c)
+        
+        # 2. 计算每个压缩器有效引脚的数量 (FA为3, HA为2)
+        valid_pin_count = torch.sum(mask_reshaped, dim=1, keepdim=True)
+        
+        # 3. 计算每个压缩器的局部中心到达时间 (Mean AT)
+        mean_ats = torch.sum(pin_ats_reshaped * mask_reshaped, dim=1, keepdim=True) / valid_pin_count
+        
+        # 4. 计算到达时间方差 (Variance) 
+        glitch_variance = torch.sum(mask_reshaped * (pin_ats_reshaped - mean_ats)**2, dim=1)
+        
+        # 5. [核心优化] 转化为标准差 (Standard Deviation)，拉升数值量级！
+        # ⚠️ 必须加上 1e-8 防止完美平衡时 torch.sqrt(0) 导致梯度爆炸产生 NaN！
+        glitch_std = torch.sqrt(glitch_variance + 1e-8)
+        
+        # 6. 全图总毛刺代价 (标准差之和)
+        expected_glitch = torch.sum(glitch_std)
+        # =========================================================================
+        
+        # 在 return 列表中加上 expected_glitch
+        return WNS, TNS, expected_area, expected_glitch, M_internal, P_c
+    
+        # return WNS, TNS, expected_area, M_internal, P_c
 ```
 
 ### `src/core/objectives.py`
@@ -1137,12 +1218,19 @@ class DOMACLossFunction(nn.Module):
         self.target_sink_count = target_sink_count
         self.pin_counts = torch.tensor(pin_counts_lib, dtype=torch.float32)
 
-    def calc_performance_loss(self, wns, tns, area, t1, t2, alpha):
+    # def calc_performance_loss(self, wns, tns, area, t1, t2, alpha):
+    #     """
+    #     1. 性能驱动损失 (Performance Objective)
+    #     """
+    #     return t1 * wns + t2 * tns + alpha * area
+    # def calc_performance_loss(self, wns, tns, area, t1, t2, alpha):
+    def calc_performance_loss(self, wns, tns, area, glitch, t1, t2, alpha, beta):
         """
         1. 性能驱动损失 (Performance Objective)
+        引入 beta * glitch 来惩罚到达时间的不平衡，从物理底层消灭毛刺功耗。
         """
-        return t1 * wns + t2 * tns + alpha * area
-
+        return t1 * wns + t2 * tns + alpha * area + beta * glitch
+    
     # def calc_bijective_mapping_loss(self, M_internal, P_c):
     #     """
     #     2. Pin-Level 双射映射约束 (Bijective Mapping Loss L_BM)
@@ -1205,22 +1293,21 @@ class DOMACLossFunction(nn.Module):
         l_sink = (excess_signals ** 2) * 100.0
         return l_sink, total_sink_signals
 
-    # def forward(self, wns, tns, area, M, P_c, hyperparams):
-    def forward(self, wns, tns, area, M, P_c, hyperparams, active_pin_mask, c_types):    
+    def forward(self, wns, tns, area, glitch, M, P_c, hyperparams, active_pin_mask, c_types):    
         """
         联合损失计算引擎
         """
         t1 = hyperparams['t1']
         t2 = hyperparams['t2']
         alpha = hyperparams['alpha']
+        beta = hyperparams.get('beta', 0.0) # 新增：提取毛刺功耗权重 (使用 get 防错)
         lambda1 = hyperparams['lambda1']
         lambda2 = hyperparams['lambda2']
         
-        # 1. 性能 Loss
-        l_perf = self.calc_performance_loss(wns, tns, area, t1, t2, alpha)
+        # 1. 性能 Loss (现在包含了功耗维度)
+        l_perf = self.calc_performance_loss(wns, tns, area, glitch, t1, t2, alpha, beta)
         
         # 2. 合法拓扑 Loss
-        # l_bm = self.calc_bijective_mapping_loss(M, P_c)
         l_bm = self.calc_bijective_mapping_loss(M, P_c, active_pin_mask, c_types)
 
         # 3. 离散化 Loss 
@@ -1229,7 +1316,6 @@ class DOMACLossFunction(nn.Module):
         l_d = l_d_M + l_d_P
         
         # 4. Sink 惩罚 Loss
-        # 我们希望最终整个乘法器这列最多只留 2 个信号给底部的加法器
         l_sink, actual_sink_count = self.calc_sink_loss(M, target_max_signals=self.target_sink_count)
         
         # 5. 总 Loss 融合
@@ -1247,7 +1333,8 @@ class DOMACLossFunction(nn.Module):
             'actual_sink_count': actual_sink_count,
             'wns': wns,
             'tns': tns,
-            'area': area
+            'area': area,
+            'glitch': glitch  # 新增：记录到日志，方便在训练时观察毛刺是否在下降
         }
         
         return total_loss, loss_dict
@@ -1558,7 +1645,7 @@ def probe_column_height_overflow(model, discrete_M):
 
 # ================= [探针 2：离散化后硬连线物理评估 & WNS 溯源] =================
 def probe_post_legalization_eval(model, loss_engine, trainer_hyperparams, discrete_M, discrete_P, final_P, pp_at, pp_slew, REQ_TIME, PP_COLS, COMP_COLS):
-    print("\n[Evaluator] 正在对坍缩后的 0/1 离散硬连线进行最终物理时序核算...")
+    print("\n[Evaluator] 正在对坍缩后的 0/1 离散硬连线进行最终物理时序与毛刺功耗核算...")
     with torch.no_grad():
         # 1. 构造离散化物理尺寸的 One-Hot 张量
         discrete_P_tensor = torch.zeros_like(final_P)
@@ -1586,14 +1673,19 @@ def probe_post_legalization_eval(model, loss_engine, trainer_hyperparams, discre
         model.p_logits.copy_(new_p_logits)
 
         # 5. 执行一次纯净的前向传播与 Loss 计算
-        eval_wns, eval_tns, eval_area, eval_M, eval_P = model(pp_at, pp_slew, tau=1.0)
+        # 【修改点 1】增加 eval_glitch 接收毛刺功耗方差
+        eval_wns, eval_tns, eval_area, eval_glitch, eval_M, eval_P = model(pp_at, pp_slew, tau=1.0)
+        
+        # 【修改点 2】将 eval_glitch 传给 loss_engine
         eval_loss, eval_dict = loss_engine(
-            eval_wns, eval_tns, eval_area, eval_M, eval_P, trainer_hyperparams, 
+            eval_wns, eval_tns, eval_area, eval_glitch, eval_M, eval_P, trainer_hyperparams, 
             model.active_pin_mask, model.c_types
         )
 
+        # 【修改点 3】在最终评估报告中打印出 Glitch 的数值
         print(f" -> [坍缩后真实指标] WNS: {eval_dict['wns'].item():.4f} ns | "
               f"Area: {eval_dict['area'].item():.4f} μm² | "
+              f"Glitch (Var): {eval_dict['glitch'].item():.6f} | "
               f"L_BM: {eval_dict['l_bm'].item():.4f} | "
               f"Total Loss: {eval_loss.item():.4f}")
         
