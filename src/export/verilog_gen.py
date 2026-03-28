@@ -105,9 +105,9 @@ class VerilogGenerator:
     def generate_multiplier_top(self, bit_width, top_file="domac.v", ct_module_name="domac_tree", top_module_name="domac"):
         """
         自动生成完整的乘法器顶层封装模块
-        包含: PPG (部分积生成阵列) + CT (DOMAC 压缩树) + CPA (末级加法器)
+        包含: 动态 Radix-4 Booth PPG + CT (DOMAC 压缩树) + CPA (末级加法器)
         """
-        print(f"[VerilogGen] 正在组装完整乘法器顶层模块: {top_file}")
+        print(f"[VerilogGen] 正在组装完整乘法器顶层模块: {top_file} (启用动态 Radix-4 Booth)")
         
         out_width = bit_width * 2
         
@@ -120,18 +120,70 @@ class VerilogGenerator:
             f.write(f");\n\n")
             
             f.write("    // ==========================================\n")
-            f.write("    // 1. Partial Product Generator (PPG) 阵列\n")
+            f.write("    // 1. Dynamic Radix-4 Booth Encoding (PPG)\n")
             f.write("    // ==========================================\n")
-            pp_wire_names = []
-            k = 0
-            for i in range(bit_width):
-                for j in range(bit_width):
-                    wire_name = f"pp_in_{k}"
-                    pp_wire_names.append(wire_name)
-                    # 硬件并行生成部分积：A的第i位 AND B的第j位
-                    f.write(f"    wire {wire_name} = A[{i}] & B[{j}];\n")
-                    k += 1
-            f.write("\n")
+            
+            # 动态推演组数与补码长度
+            G = (bit_width + 2) // 2 
+            pad_len = 2 * G - bit_width
+            max_cols = bit_width * 2
+            
+            # 操作数 B 扩展 (确保总长度为奇数 2G+1，最低位补0用于 Booth 初始位)
+            f.write(f"    wire [{pad_len + bit_width}:0] B_pad = {{{pad_len}'b0, B, 1'b0}};\n")
+            # 操作数 A 扩展 (防溢出)
+            f.write(f"    wire [{bit_width}:0] A_pad = {{1'b0, A}};\n\n")
+
+            pp_dots_by_col = [[] for _ in range(max_cols)]
+            
+            for i in range(G):
+                f.write(f"    // --- Group {i} ---\n")
+                f.write(f"    wire [2:0] b_win_{i} = B_pad[{i*2+2}:{i*2}];\n")
+                
+                f.write(f"    wire neg_{i}  = b_win_{i}[2];\n")
+                f.write(f"    wire zero_{i} = (b_win_{i} == 3'b000) | (b_win_{i} == 3'b111);\n")
+                f.write(f"    wire one_{i}  = b_win_{i}[0] ^ b_win_{i}[1];\n")
+                f.write(f"    wire two_{i}  = ~zero_{i} & ~one_{i};\n\n")
+                
+                f.write(f"    wire [{bit_width}:0] pp_base_{i};\n")
+                f.write(f"    assign pp_base_{i} = ({{{bit_width+1}{{one_{i}}}}} & A_pad) | ({{{bit_width+1}{{two_{i}}}}} & (A_pad << 1));\n")
+                f.write(f"    wire [{bit_width}:0] pp_val_{i} = neg_{i} ? ~pp_base_{i} : pp_base_{i};\n\n")
+                
+                # 物理落位映射
+                start_col = i * 2
+                
+                # (a) 基础数据落位
+                for j in range(bit_width + 1):
+                    col = start_col + j
+                    if col < max_cols:
+                        pp_dots_by_col[col].append(f"pp_val_{i}[{j}]")
+                        
+                # (b) 补偿位落位
+                if start_col < max_cols:
+                    pp_dots_by_col[start_col].append(f"neg_{i}")
+                    
+               # (c) 修改型符号扩展 (修复版)
+                sign_col = start_col + bit_width + 1
+                if i == 0:
+                    if sign_col < max_cols:
+                        pp_dots_by_col[sign_col].append(f"~neg_{i}") # [修正] 直接使用 ~neg_i 作为真·符号位
+                        pp_dots_by_col[sign_col].append("1'b1")
+                    if sign_col + 1 < max_cols:
+                        pp_dots_by_col[sign_col + 1].append("1'b1")
+                elif i < G - 1:
+                    if sign_col < max_cols:
+                        pp_dots_by_col[sign_col].append(f"~neg_{i}") # [修正] 使用 ~neg_i
+                    if sign_col + 1 < max_cols:
+                        pp_dots_by_col[sign_col + 1].append("1'b1")  # [修正] 补偿常数向左移 1 bit
+
+            f.write("    // --- DOMAC Canvas Mapping ---\n")
+            pp_index = 0
+            for col in range(max_cols):
+                dots_in_this_col = pp_dots_by_col[col]
+                for dot_signal in dots_in_this_col:
+                    f.write(f"    wire pp_in_{pp_index} = {dot_signal};\n")
+                    pp_index += 1
+                    
+            f.write(f"    // Total Booth dots mapped to CT: {pp_index}\n\n")
             
             f.write("    // ==========================================\n")
             f.write("    // 2. DOMAC AI 优化压缩树 (CT)\n")
@@ -159,37 +211,48 @@ class VerilogGenerator:
             f.write("    // ==========================================\n")
             f.write("    // 将压缩树残留的杂散信号按二进制权重对齐重建，送入高速 CPA\n")
             
-            # 分类收集不同权重的信号
-            col_signals = {w: [] for w in range(out_width)}
+           # ==========================================================
+            # 3. Carry-Propagate Adder (CPA) 加法器
+            # ==========================================================
+            f.write("    // 动态重建向量: 捕获 Booth 压缩树可能外溢的冗余进位\n")
+            
+            # 1. 动态获取 CT 实际输出的最大位权（包含进位外溢）
+            max_ct_weight = max([weight for _, weight in self.tb_output_ports])
+            cpa_width = max(out_width, max_ct_weight + 1)
+            
+            # 2. 分类收集不同权重的信号
+            col_signals = {w: [] for w in range(cpa_width)}
             for out_name, weight in self.tb_output_ports:
                 col_signals[weight].append(out_name)
                 
-            # 动态重建向量: 保证能够被标准的 assign P = vec0 + vec1 完美吸收
-            # 如果某列刚好压缩到剩 2 根线，这里就会生成 vec_0 和 vec_1 两个 32-bit 向量
+            # 3. 重组加法向量
             max_depth = max([len(sigs) for sigs in col_signals.values()])
             
             vec_names = []
             for d in range(max_depth):
                 vec_name = f"cpa_vec_{d}"
                 vec_names.append(vec_name)
-                f.write(f"    wire [{out_width-1}:0] {vec_name};\n")
+                f.write(f"    wire [{cpa_width-1}:0] {vec_name};\n")
                 
                 # 为该向量的每一位赋值
-                for w in range(out_width):
+                for w in range(cpa_width):
                     if d < len(col_signals[w]):
                         f.write(f"    assign {vec_name}[{w}] = {col_signals[w][d]};\n")
                     else:
                         f.write(f"    assign {vec_name}[{w}] = 1'b0; // 缺位补零\n")
                 f.write("\n")
             
-            f.write("    // 综合工具 (Design Compiler) 会将下述加法自动推断为极速并行前缀加法器\n")
+            f.write("    // 综合工具会自动推断并行前缀加法器，并安全截断高位的冗余进位\n")
             sum_expr = " + ".join(vec_names)
-            f.write(f"    assign P = {sum_expr};\n\n")
+            f.write(f"    wire [{cpa_width-1}:0] cpa_sum_full = {sum_expr};\n")
+            
+            # 4. 物理截断，严丝合缝对齐顶层模块的 out_width
+            f.write(f"    assign P = cpa_sum_full[{out_width-1}:0];\n\n")
             
             f.write("endmodule\n")
             
-        print(f"[VerilogGen] 顶层模块封装完毕！可直接送入综合工具。")
-
+        print(f"[VerilogGen] 顶层模块封装完毕！包含自适应 Booth 阵列 (CPA 宽度自动扩展至 {cpa_width} bit)。")
+        
     def generate_pure_dadda_baseline(self, bit_width, output_file="dadda_baseline_ct.v", top_file="dadda.v"):
         """
         [Dr. Gemini 基准线生成器] 直接输出纯正的 Dadda Tree 初始 Verilog 网表
@@ -205,11 +268,14 @@ class VerilogGenerator:
         signals = [[] for _ in range(max_cols)]
         
         # 1. 初始化部分积信号池
-        k = 0
-        for i in range(bit_width):
-            for j in range(bit_width):
-                signals[i+j].append(f"pp_in_{k}")
-                k += 1
+        # k = 0
+        # for i in range(bit_width):
+        #     for j in range(bit_width):
+        #         signals[i+j].append(f"pp_in_{k}")
+        #         k += 1
+        # [修复替换为]
+        for k, col in enumerate(self.pp_cols):
+            signals[col].append(f"pp_in_{k}")
                 
         # 2. 推导目标高度序列
         dadda_seq = [2]
@@ -291,7 +357,9 @@ class VerilogGenerator:
         # 5. 生成压缩树 (CT) 网表文件
         with open(output_file, 'w') as f:
             f.write("module dadda_baseline_ct (\n")
-            inputs = [f"pp_in_{i}" for i in range(bit_width * bit_width)]
+            # inputs = [f"pp_in_{i}" for i in range(bit_width * bit_width)]
+            inputs = [f"pp_in_{i}" for i in range(self.num_pp)]
+
             f.write(f"    input wire {', '.join(inputs)},\n")
             outputs = [name for name, _ in outputs_with_weights]
             f.write(f"    output wire {', '.join(outputs)}\n")

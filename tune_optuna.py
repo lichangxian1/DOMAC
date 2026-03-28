@@ -116,33 +116,34 @@ def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_co
     )
 
     def objective(trial):
-        # param_combination = {
-        #     't1': trial.suggest_float('t1', 1, 4, step=0.05),       
-        #     't2': trial.suggest_float('t2', 0.05, 0.5 ,step=0.05),  
-        #     'lambda1': trial.suggest_float('lambda1', 0.02, 0.7, step=0.02), 
-        #     'lambda2': trial.suggest_float('lambda2', 0.02, 0.7, step=0.02),
-        #     'tau_k':0.995,
-        #     'seed': 42,
-        #     'max_epochs':300,
-        #     'init_noise_std': 0.01,
-        #     'beta':trial.suggest_float('beta', 0.0001,0.01)  # 新增：毛刺功耗权重，适度关注毛刺下降但不至于过早牺牲性能
-        #     # 【新增】把学习率交给贝叶斯寻优，搜索区间 0.01 到 0.1
-        #     'lr': trial.suggest_float('lr', 0.01, 0.1, log=True)
-        # }
-        
         param_combination = {
-            't1': 1.5,     # WNS 权重拉到极致，逼迫网络突破延迟极限
-            't2': 0.223,       # TNS 辅助全局路径寻优
-            'alpha': 1,    # 【封印】前期绝对不许管面积！
-            'lambda1': 0.2,  # 连线合法性是必须的
-            'lambda2': 0.2,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+            't1': trial.suggest_float('t1', 1, 4, step=0.05),       
+            't2': trial.suggest_float('t2', 0.05, 0.5 ,step=0.05),  
+            'alpha':trial.suggest_float('alpha', 0.1, 2 ,step=0.1),  
+            'lambda1': trial.suggest_float('lambda1', 0.02, 0.7, step=0.02), 
+            'lambda2': trial.suggest_float('lambda2', 0.02, 0.7, step=0.02),
             'tau_k':0.995,
             'seed': 42,
             'max_epochs':300,
             'init_noise_std': 0.01,
-            'beta': trial.suggest_float('beta', 0.0001,0.01),     # 新增：毛刺功耗权重，适度关注毛刺下降但不至于过早牺牲性能
+            'beta':trial.suggest_float('beta', 0.0001,0.01,step=0.0001),  # 新增：毛刺功耗权重，适度关注毛刺下降但不至于过早牺牲性能
+            # 【新增】把学习率交给贝叶斯寻优，搜索区间 0.01 到 0.1
             'lr': trial.suggest_float('lr', 0.01, 0.1, log=True)
         }
+        
+        # param_combination = {
+        #     't1': 1.5,     # WNS 权重拉到极致，逼迫网络突破延迟极限
+        #     't2': 0.223,       # TNS 辅助全局路径寻优
+        #     'alpha': 1,    # 【封印】前期绝对不许管面积！
+        #     'lambda1': 0.2,  # 连线合法性是必须的
+        #     'lambda2': 0.2,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+        #     'tau_k':0.995,
+        #     'seed': 42,
+        #     'max_epochs':300,
+        #     'init_noise_std': 0.01,
+        #     'beta': trial.suggest_float('beta', 0.0001,0.01),     # 新增：毛刺功耗权重，适度关注毛刺下降但不至于过早牺牲性能
+        #     'lr': trial.suggest_float('lr', 0.01, 0.1, log=True)
+        # }
 
         FIXED_SEED = param_combination['seed']
         torch.manual_seed(FIXED_SEED)
@@ -248,7 +249,7 @@ def main():
     # 案例 3: 功耗-时序双雄博弈 (压制毛刺方差的同时保住时序)
     # 注意: Glitch (方差) 数值极小 (0.0001~0.01级别)，因此需要给它 10.0 ~ 100.0 的高权重才能与 WNS(0.7ns级别) 抗衡
     TARGET_WEIGHTS = {
-        'wns': 0, 
+        'wns': 1, 
         'area': 0.0000, 
         'glitch': 1.0 
     }
@@ -262,7 +263,7 @@ def main():
         nldm_db = parser.parse()
         fa_tensors = [nldm_db[c] for c in TARGET_CELLS if c.startswith('FA')]
         ha_tensors = [nldm_db[c] for c in TARGET_CELLS if c.startswith('HA')]
-        BIT_WIDTH = 8
+        BIT_WIDTH = 12
         pp_cols, comp_cols, c_types = generate_multiplier_canvas(BIT_WIDTH)
 
     TOTAL_TRIALS = 500
