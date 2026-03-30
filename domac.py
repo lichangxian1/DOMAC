@@ -12,17 +12,29 @@ from src.core.compressor_tree import DOMAC_CompressorTree
 from src.core.objectives import DOMACLossFunction
 from src.optimizer.train import DOMACTrainer
 from src.optimizer.legalizer import DOMACLegalizer
-from src.export.verilog_gen import VerilogGenerator
 
-# ================= [引入剥离出去的核心组件与探针] =================
-from src.core.domac_utils import (
-    create_physical_tensor_mock, 
-    generate_multiplier_canvas, 
-    generate_dadda_init_matrix,
-    probe_column_height_overflow,
-    probe_post_legalization_eval,
-    probe_wavefront_at
-)
+USE_BOOTH = False   # 想切换时只改这一行
+
+if USE_BOOTH:
+    from src.export.verilog_gen_booth import VerilogGenerator
+    from src.core.domac_utils_booth import (
+        create_physical_tensor_mock,
+        generate_multiplier_canvas,
+        generate_dadda_init_matrix,
+        probe_column_height_overflow,
+        probe_post_legalization_eval,
+        probe_wavefront_at
+    )
+else:
+    from src.export.verilog_gen import VerilogGenerator
+    from src.core.domac_utils import (
+        create_physical_tensor_mock,
+        generate_multiplier_canvas,
+        generate_dadda_init_matrix,
+        probe_column_height_overflow,
+        probe_post_legalization_eval,
+        probe_wavefront_at
+    )
 
 def main():
     print("="*60)
@@ -85,7 +97,10 @@ def main():
     BIT_WIDTH = 12
     TARGET_SINK_COUNT = (BIT_WIDTH * 2 - 1) * 2
     # 接收包含物理延迟的 4 个返回值
-    PP_COLS, COMP_COLS, C_TYPES, PP_AT_INIT = generate_multiplier_canvas(BIT_WIDTH)
+    if USE_BOOTH:
+        PP_COLS, COMP_COLS, C_TYPES, PP_AT_INIT = generate_multiplier_canvas(BIT_WIDTH)
+    else:
+        PP_COLS, COMP_COLS, C_TYPES = generate_multiplier_canvas(BIT_WIDTH)
     NUM_PP = len(PP_COLS)
     NUM_COMPRESSORS = len(COMP_COLS)
 
@@ -96,7 +111,10 @@ def main():
         torch.backends.cudnn.benchmark = True 
 
     # 【核心修复】将真实物理延迟作为 Tensor 喂给 AI
-    pp_at = torch.tensor(PP_AT_INIT, dtype=torch.float32, device=device)
+    if USE_BOOTH:
+        pp_at = torch.tensor(PP_AT_INIT, dtype=torch.float32, device=device)
+    else:
+        pp_at = torch.full((NUM_PP,), 0.1, device=device)
     pp_slew = torch.full((NUM_PP,), 0.02, device=device)
     REQ_TIME = 0 
     print("REQ_TIME：" + str(REQ_TIME))
