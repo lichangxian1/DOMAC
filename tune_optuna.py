@@ -85,7 +85,7 @@ def evaluate_discrete_physical_metrics(model, loss_engine, hyperparams, discrete
 
 # ================= [核心重构：多进程独立 Worker] =================
 # 【修改点 4】: 在函数签名中接收 target_weights 目标权重字典
-def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_cols, comp_cols, c_types, bit_width, progress_queue, num_trials, target_weights):
+def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_cols, comp_cols, c_types, bit_width, progress_queue, num_trials, target_weights, pp_at_init):
     """
     独立进程 Worker：独享 GIL 和 CUDA
     """
@@ -128,7 +128,7 @@ def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_co
             'init_noise_std': 0.01,
             'beta':trial.suggest_float('beta', 0.0001,0.01,step=0.0001),  # 新增：毛刺功耗权重，适度关注毛刺下降但不至于过早牺牲性能
             # 【新增】把学习率交给贝叶斯寻优，搜索区间 0.01 到 0.1
-            'lr': trial.suggest_float('lr', 0.01, 0.1, log=True)
+            'lr': 0.05
         }
         
         # param_combination = {
@@ -188,7 +188,8 @@ def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_co
                 trainer = DOMACTrainer(model, loss_engine, lr=param_combination['lr'])
                 trainer.hyperparams.update(param_combination)
 
-                pp_at = torch.full((num_pp,), 0.1, device=device)
+                # 【核心修复】将真实物理延迟作为 Tensor 喂给 AI
+                pp_at = torch.tensor(pp_at_init, dtype=torch.float32, device=device)
                 pp_slew = torch.full((num_pp,), 0.02, device=device)
 
                 final_M, final_P = trainer.train(pp_at, pp_slew, max_epochs=MAX_EPOCHS, epoch_callback=epoch_callback_fn)
@@ -264,7 +265,8 @@ def main():
         fa_tensors = [nldm_db[c] for c in TARGET_CELLS if c.startswith('FA')]
         ha_tensors = [nldm_db[c] for c in TARGET_CELLS if c.startswith('HA')]
         BIT_WIDTH = 12
-        pp_cols, comp_cols, c_types = generate_multiplier_canvas(BIT_WIDTH)
+        # 接收包含物理延迟的 4 个返回值
+        pp_cols, comp_cols, c_types, PP_AT_INIT = generate_multiplier_canvas(BIT_WIDTH)
 
     TOTAL_TRIALS = 500
     CONCURRENT_WORKERS = 6
@@ -298,10 +300,10 @@ def main():
     with ProcessPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
         futures = []
         for n_trials in trials_per_worker:
-            # 【修改点 7】: 将 TARGET_WEIGHTS 安全地传递给子进程 Worker
+            # 【修复】把 PP_AT_INIT 加到传参列表的最后
             future = executor.submit(
                 optuna_worker_process, 
-                storage_url, study_name, fa_tensors, ha_tensors, pp_cols, comp_cols, c_types, BIT_WIDTH, progress_queue, n_trials, TARGET_WEIGHTS
+                storage_url, study_name, fa_tensors, ha_tensors, pp_cols, comp_cols, c_types, BIT_WIDTH, progress_queue, n_trials, TARGET_WEIGHTS, PP_AT_INIT
             )
             futures.append(future)
             

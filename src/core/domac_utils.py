@@ -22,56 +22,61 @@ def generate_multiplier_canvas(bit_width):
     动态模拟点阵分布，保证与 Verilog RTL 拓扑 100% 对齐。
     """
     print(f"\n[Canvas Generator] 动态推演 {bit_width}x{bit_width} 无符号 Radix-4 Booth 乘法器画布...")
-    
-    # 计算需要生成的 Booth 编码组数 G
-    # 规律: W=8 -> G=5; W=12 -> G=7; W=16 -> G=9
     G = (bit_width + 2) // 2 
     max_cols = bit_width * 2
-    col_heights = [0] * max_cols
     
-    # ---------------------------------------------------------
-    # 物理点阵坐标模拟器 (严格同步 RTL 映射)
-    # ---------------------------------------------------------
+    # 不再只存数量，而是存每个点的具体延迟！
+    # pp_matrix[col] = [delay1, delay2, ...]
+    pp_matrix = [[] for _ in range(max_cols)]
+    
+    # 根据 28nm 工艺设定的真实到达时间基准 (ns)
+    DELAY_NORMAL = 0.08  # 基础数据位 (混合了 +A, -A 的均值)
+    DELAY_NEG    = 0.11  # 进位/符号控制位 (最慢)
+    DELAY_CONST  = 0.00  # 常数 1 (最快)
+    
     for i in range(G):
         start_col = i * 2
         
-        # 1. 基础部分积数据位 (宽度为 bit_width + 1)
+        # 1. 基础部分积数据位
         for j in range(bit_width + 1):
             col = start_col + j
             if col < max_cols:
-                col_heights[col] += 1
+                pp_matrix[col].append(DELAY_NORMAL)
                 
         # 2. 负数补码的 +1 补偿位
         if start_col < max_cols:
-            col_heights[start_col] += 1
+            pp_matrix[start_col].append(DELAY_NEG)
             
         # 3. 符号位扩展技巧 (修改型扩展 - 修复版)
         sign_col = start_col + bit_width + 1
         if i == 0:
             if sign_col < max_cols:
-                col_heights[sign_col] += 2      # ~neg_0 和 常数1
+                pp_matrix[sign_col].append(DELAY_NEG)   # ~neg_0
+                pp_matrix[sign_col].append(DELAY_CONST) # 常数1
             if sign_col + 1 < max_cols:
-                col_heights[sign_col + 1] += 1  # 补偿的常数1
+                pp_matrix[sign_col + 1].append(DELAY_CONST) # 补偿的常数1
         elif i < G - 1:
             if sign_col < max_cols:
-                col_heights[sign_col] += 1      # [修正] 仅放入 ~neg_i，去掉错误的同列堆叠
+                pp_matrix[sign_col].append(DELAY_NEG)   # ~neg_i
             if sign_col + 1 < max_cols:
-                col_heights[sign_col + 1] += 1  # [修正] 常数 1 必须后移至下一列 (sign_col + 1)
+                pp_matrix[sign_col + 1].append(DELAY_CONST) # 常数1
 
-    # 展开为引擎所需的格式
+    # 展开为 DOMAC 引擎所需的 1D 列表
     pp_cols = []
-    for col, count in enumerate(col_heights):
-        for _ in range(count):
+    pp_at_init = []
+    
+    for col in range(max_cols):
+        for delay in pp_matrix[col]:
             pp_cols.append(col)
+            pp_at_init.append(delay)
 
     print(f" -> Booth 编码组数: {G}")
-    print(f" -> 编码后最大列高: {max(col_heights)}")
     print(f" -> 动态分配的初始 PP 节点总数: {len(pp_cols)}")
 
     # ---------------------------------------------------------
     # Dadda 树目标高度推演与压缩分配 (自适应高度)
     # ---------------------------------------------------------
-    dots_in_col = list(col_heights)
+    dots_in_col = [len(col_dots) for col_dots in pp_matrix]
     
     dadda_seq = [2]
     while dadda_seq[-1] < max(dots_in_col):
@@ -128,7 +133,7 @@ def generate_multiplier_canvas(bit_width):
     comp_cols = [x[0] for x in combined]
     c_types = [x[1] for x in combined]
 
-    return pp_cols, comp_cols, c_types
+    return pp_cols, comp_cols, c_types, pp_at_init
     
 def generate_dadda_init_matrix(bit_width, pp_cols, c_cols, c_types):
     """

@@ -4,6 +4,7 @@ import torch
 import time
 import subprocess
 
+torch.set_num_threads(1)
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from src.parser.lib_parser import NLDMParser
@@ -83,7 +84,8 @@ def main():
         
     BIT_WIDTH = 12
     TARGET_SINK_COUNT = (BIT_WIDTH * 2 - 1) * 2
-    PP_COLS, COMP_COLS, C_TYPES = generate_multiplier_canvas(BIT_WIDTH)
+    # 接收包含物理延迟的 4 个返回值
+    PP_COLS, COMP_COLS, C_TYPES, PP_AT_INIT = generate_multiplier_canvas(BIT_WIDTH)
     NUM_PP = len(PP_COLS)
     NUM_COMPRESSORS = len(COMP_COLS)
 
@@ -93,7 +95,8 @@ def main():
         print(f" -> 检测到显卡: {torch.cuda.get_device_name(0)}")
         torch.backends.cudnn.benchmark = True 
 
-    pp_at = torch.full((NUM_PP,), 0.1, device=device)
+    # 【核心修复】将真实物理延迟作为 Tensor 喂给 AI
+    pp_at = torch.tensor(PP_AT_INIT, dtype=torch.float32, device=device)
     pp_slew = torch.full((NUM_PP,), 0.02, device=device)
     REQ_TIME = 0 
     print("REQ_TIME：" + str(REQ_TIME))
