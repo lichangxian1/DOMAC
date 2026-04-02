@@ -163,12 +163,12 @@ def main():
     ).to(device)
 
     loss_engine = DOMACLossFunction(target_sink_count=TARGET_SINK_COUNT)
-    trainer = DOMACTrainer(model, loss_engine, lr=0.05)
+    trainer = DOMACTrainer(model, loss_engine, lr=0.066)
     
     print("\n[Engine] 物理映射与梯度反向传播开始...")
     
     start_time = time.time()
-    final_M, final_P = trainer.train(pp_at, pp_slew, max_epochs=300)
+    final_M, final_P = trainer.train(pp_at, pp_slew, max_epochs=270)
     
     print("\n[System] 优化执行完毕！网表拓扑已坍缩至离散界限附近。")
     

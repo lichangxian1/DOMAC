@@ -20,8 +20,28 @@ from src.core.objectives import DOMACLossFunction
 from src.optimizer.train import DOMACTrainer
 from src.optimizer.legalizer import DOMACLegalizer
 from src.parser.lib_parser import NLDMParser
-from src.core.domac_utils import generate_multiplier_canvas
 
+USE_BOOTH = 0   # 想切换时只改这一行
+
+if USE_BOOTH:
+    from src.core.domac_utils_booth import (
+        create_physical_tensor_mock,
+        generate_multiplier_canvas,
+        generate_dadda_init_matrix,
+        probe_column_height_overflow,
+        probe_post_legalization_eval,
+        probe_wavefront_at
+    )
+else:
+    from src.core.domac_utils import (
+        create_physical_tensor_mock,
+        generate_multiplier_canvas,
+        generate_dadda_init_matrix,
+        probe_column_height_overflow,
+        probe_post_legalization_eval,
+        probe_wavefront_at
+    )
+    
 class HiddenPrints:
     def __enter__(self):
         self._original_stdout = sys.stdout
@@ -85,7 +105,7 @@ def evaluate_discrete_physical_metrics(model, loss_engine, hyperparams, discrete
 
 # ================= [核心重构：多进程独立 Worker] =================
 # 【修改点 4】: 在函数签名中接收 target_weights 目标权重字典
-def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_cols, comp_cols, c_types, bit_width, progress_queue, num_trials, target_weights, pp_at_init):
+def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_cols, comp_cols, c_types, bit_width, progress_queue, num_trials, target_weights, pp_at_init=0):
     """
     独立进程 Worker：独享 GIL 和 CUDA
     """
@@ -117,18 +137,18 @@ def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_co
 
     def objective(trial):
         param_combination = {
-            't1': trial.suggest_float('t1', 1, 4, step=0.05),       
-            't2': trial.suggest_float('t2', 0.05, 0.5 ,step=0.05),  
-            'alpha':trial.suggest_float('alpha', 0.1, 2 ,step=0.1),  
-            'lambda1': trial.suggest_float('lambda1', 0.02, 0.7, step=0.02), 
-            'lambda2': trial.suggest_float('lambda2', 0.02, 0.7, step=0.02),
+            't1': 1,     # WNS 权重拉到极致，逼迫网络突破延迟极限
+            't2': 0.4,       # TNS 辅助全局路径寻优
+            'alpha': 1,    # 【封印】前期绝对不许管面积！
+            'lambda1': 0.68,  # 连线合法性是必须的
+            'lambda2': 0.54,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
             'tau_k':0.995,
+            'beta': 0.0015,     # 新增：毛刺功耗权重，适度关注毛刺下降但不至于过早牺牲性能
             'seed': 42,
-            'max_epochs':300,
+            'max_epochs': trial.suggest_int('max_epochs', 200, 600, step=10),
             'init_noise_std': 0.01,
-            'beta':trial.suggest_float('beta', 0.0001,0.01,step=0.0001),  # 新增：毛刺功耗权重，适度关注毛刺下降但不至于过早牺牲性能
             # 【新增】把学习率交给贝叶斯寻优，搜索区间 0.01 到 0.1
-            'lr': 0.05
+            'lr':trial.suggest_float('lr', 0.001,1,log=True)
         }
         
         # param_combination = {
@@ -158,7 +178,7 @@ def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_co
         init_p = init_p_cpu.to(device)
         
         completed_epochs = 0
-        MAX_EPOCHS = param_combination['max_epochs']
+        MAX_EPOCHS = int(param_combination['max_epochs'])
 
         def epoch_callback_fn(epoch, current_wns):
             nonlocal completed_epochs
@@ -189,7 +209,12 @@ def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_co
                 trainer.hyperparams.update(param_combination)
 
                 # 【核心修复】将真实物理延迟作为 Tensor 喂给 AI
-                pp_at = torch.tensor(pp_at_init, dtype=torch.float32, device=device)
+                # pp_at = torch.tensor(pp_at_init, dtype=torch.float32, device=device)
+                if USE_BOOTH:
+                    pp_at = torch.tensor(pp_at_init, dtype=torch.float32, device=device)
+                else:
+                    pp_at = torch.full((num_pp,), 0.1, device=device)
+                    
                 pp_slew = torch.full((num_pp,), 0.02, device=device)
 
                 final_M, final_P = trainer.train(pp_at, pp_slew, max_epochs=MAX_EPOCHS, epoch_callback=epoch_callback_fn)
@@ -208,6 +233,8 @@ def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_co
             except optuna.TrialPruned:
                 raise
             except Exception as e:
+                import traceback
+                sys.stderr.write(f"\n[Trial 崩溃] {traceback.format_exc()}\n") # 确保能看到死因
                 return 999.0
             finally:
                 rem_epochs = MAX_EPOCHS - completed_epochs
@@ -257,6 +284,11 @@ def main():
     
     print(f" [Target] 当前优化目标权重: WNS({TARGET_WEIGHTS.get('wns', 0)}), Area({TARGET_WEIGHTS.get('area', 0)}), Glitch({TARGET_WEIGHTS.get('glitch', 0)})")
     
+    if USE_BOOTH:
+        print(" [Mode] 当前模式: Booth 模式")
+    else:
+        print(" [Mode] 当前模式: 经典模式")
+
     with HiddenPrints():
         TARGET_CELLS = ['FA1D0BWP12T40P140', 'HA1D0BWP12T40P140','FA1D1BWP12T40P140', 'HA1D1BWP12T40P140','FA1D2BWP12T40P140', 'HA1D2BWP12T40P140','FA1D4BWP12T40P140', 'HA1D4BWP12T40P140']
         lib_path = "/home/changxian/library/t28_official/tcbn28hpcplusbwp12t40p140tt0p9v25c.lib"
@@ -266,7 +298,10 @@ def main():
         ha_tensors = [nldm_db[c] for c in TARGET_CELLS if c.startswith('HA')]
         BIT_WIDTH = 12
         # 接收包含物理延迟的 4 个返回值
-        pp_cols, comp_cols, c_types, PP_AT_INIT = generate_multiplier_canvas(BIT_WIDTH)
+        if USE_BOOTH:
+            pp_cols, comp_cols, c_types, PP_AT_INIT = generate_multiplier_canvas(BIT_WIDTH)
+        else:
+            pp_cols, comp_cols, c_types = generate_multiplier_canvas(BIT_WIDTH)
 
     TOTAL_TRIALS = 500
     CONCURRENT_WORKERS = 6
@@ -300,11 +335,17 @@ def main():
     with ProcessPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
         futures = []
         for n_trials in trials_per_worker:
-            # 【修复】把 PP_AT_INIT 加到传参列表的最后
-            future = executor.submit(
-                optuna_worker_process, 
-                storage_url, study_name, fa_tensors, ha_tensors, pp_cols, comp_cols, c_types, BIT_WIDTH, progress_queue, n_trials, TARGET_WEIGHTS, PP_AT_INIT
-            )
+            if USE_BOOTH:
+                future = executor.submit(
+                    optuna_worker_process, 
+                    storage_url, study_name, fa_tensors, ha_tensors, pp_cols, comp_cols, c_types, BIT_WIDTH, progress_queue, n_trials, TARGET_WEIGHTS, PP_AT_INIT  # Booth 模式直接传初始 PP 列作为延迟输入
+                )
+            else:
+                future = executor.submit(
+                    optuna_worker_process, 
+                    storage_url, study_name, fa_tensors, ha_tensors, pp_cols, comp_cols, c_types, BIT_WIDTH, progress_queue, n_trials, TARGET_WEIGHTS, 0
+                )
+          
             futures.append(future)
             
         for future in as_completed(futures):
@@ -341,4 +382,5 @@ def main():
 
 if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
+    mp.set_sharing_strategy('file_system')
     main()
