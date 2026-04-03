@@ -190,8 +190,11 @@ class NLDMParser:
 if __name__ == "__main__":
     TSMC28_LIB_PATH = "/home/changxian/library/t28_official/tcbn28hpcplusbwp12t40p140tt0p9v25c.lib"
     TARGET_CELLS = ['FA1D1BWP12T40P140', 'HA1D1BWP12T40P140'] 
-    
     parser = NLDMParser(TSMC28_LIB_PATH, TARGET_CELLS)
+    # NANGATE_LIB_PATH = "/home/changxian/freepdk-45nm-master/stdcells.lib"
+    # TARGET_CELLS = ['FA_X1', 'HA_X1'] 
+    # parser = NLDMParser(NANGATE_LIB_PATH, TARGET_CELLS)
+    
     nldm_tensors = parser.parse()
     
     # 验证输出结构

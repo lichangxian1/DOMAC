@@ -48,12 +48,14 @@ def main():
     #     'HA1D0BWP12T40P140',
     # ]
     TARGET_CELLS = ['FA1D0BWP12T40P140', 'HA1D0BWP12T40P140','FA1D1BWP12T40P140', 'HA1D1BWP12T40P140','FA1D2BWP12T40P140', 'HA1D2BWP12T40P140','FA1D4BWP12T40P140', 'HA1D4BWP12T40P140']
-    
+    # TARGET_CELLS = ['FA_X1', 'HA_X1']
+
     fa_names = [c for c in TARGET_CELLS if c.startswith('FA')]
     ha_names = [c for c in TARGET_CELLS if c.startswith('HA')]
     
     try:
         lib_path = "/home/changxian/library/t28_official/tcbn28hpcplusbwp12t40p140tt0p9v25c.lib"
+        # lib_path = "/home/changxian/freepdk-45nm-master/stdcells.lib"
         if os.path.exists(lib_path):
             print("[System] 发现 PDK 物理库，启动解析...")
             parser = NLDMParser(lib_path, TARGET_CELLS)
