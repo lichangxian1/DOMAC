@@ -18,13 +18,13 @@ class DOMACTrainer:
         # ])
 
         self.hyperparams = {
-            't1': 1,     # WNS 权重拉到极致，逼迫网络突破延迟极限
-            't2': 0.4,       # TNS 辅助全局路径寻优
-            'alpha': 1,    # 【封印】前期绝对不许管面积！
-            'lambda1': 0.68,  # 连线合法性是必须的
-            'lambda2': 0.54,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+            't1': 1.45,     # WNS 权重拉到极致，逼迫网络突破延迟极限
+            't2': 0.0,       # TNS 辅助全局路径寻优
+            'alpha': 0,    # 【封印】前期绝对不许管面积！
+            'lambda1': 0.0,  # 连线合法性是必须的
+            'lambda2': 0.0,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
             'tau_k':0.995,
-            'beta': 0.0015,     # 新增：毛刺功耗权重，适度关注毛刺下降但不至于过早牺牲性能
+            'beta': 0.00,  
         }
         
         # self.hyperparams = {
@@ -38,13 +38,22 @@ class DOMACTrainer:
         # }
  
     def update_hyperparameters(self, epoch):
-        if epoch >= 100:
-            self.hyperparams['alpha'] *= 1.003
-            self.hyperparams['t1'] *= 1.005
+        if 100 <= epoch < 200:
+            self.hyperparams['t1'] *= 1.005       # WNS (Performance) 绝对优先，持续缓慢施压
             self.hyperparams['t2'] *= 1.005
-            self.hyperparams['lambda1'] *= 1.01
+            self.hyperparams['beta'] *= 1.01      # [修复点] 将 1.05 降到 1.01，温和引入功耗惩罚，平滑到达时间
+            self.hyperparams['lambda1'] *= 1.01   # 连线合法性必须逐步收紧
             self.hyperparams['lambda2'] *= 1.01
-            self.hyperparams['beta'] *= 1.05
+            # 核心逻辑：此阶段 alpha (面积) 保持冰封或原样，给功耗优化留出绝对的空间
+
+        # 阶段 3 (Epoch 200 之后): 面积回收与物理坍缩
+        elif epoch >= 200:
+            self.hyperparams['t1'] *= 1.005       # 时序霸权不可动摇
+            self.hyperparams['t2'] *= 1.005
+            self.hyperparams['beta'] *= 1.002     # 功耗压制转为平稳维持（防暴涨）
+            self.hyperparams['alpha'] *= 1.01     # 面积 (Area) 垫底，此时才开始发力清理冗余逻辑门
+            self.hyperparams['lambda1'] *= 1.02   # 逼近 Legalizer，增强合法性惩罚
+            self.hyperparams['lambda2'] *= 1.05   # 终极二值化施压，逼迫概率走向 0 或 1
     # def update_hyperparameters(self, epoch):
     #     """
     #     动态退火调度器：分阶段释放约束

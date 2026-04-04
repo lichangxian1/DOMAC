@@ -281,33 +281,7 @@ class DOMAC_CompressorTree(nn.Module):
         all_ats_tensor = torch.cat([pp_at, s_ats_t, co_ats_t])
         
         slacks = self.req_time - all_ats_tensor
-
-        # # =========================================================================
-        # # 🚀 [核弹级物理修复：可微 CPA 代理模型 (Differentiable CPA Proxy)]
-        # # =========================================================================
-        # # 1. 计算每个节点流向外部 CPA (Sink) 的连续概率
-        # sink_probs = 1.0 - torch.sum(M_internal, dim=1)
-        # sink_probs = torch.clamp(sink_probs, min=0.0, max=1.0)
         
-        # # 2. 假设 28nm 工艺下，CPA 内部每经过 1 bit 的进位延迟约为 0.035 ns
-        # # 你可以根据实际库的 FA CI->CO 延迟微调这个值
-        # CPA_CARRY_DELAY_PER_BIT = 0.035 
-        # max_col = max(self.node_cols)
-        
-        # # 3. 构造与所有节点对应的列权重张量，并送入 GPU
-        # cols_tensor = torch.tensor(self.node_cols, dtype=torch.float32, device=all_ats_tensor.device)
-        
-        # # 4. 计算每个节点的 CPA 进位惩罚：
-        # # 如果你处于第 c 列，且流向了 Sink，那么你必须为后续的 (max_col - c) 个进位链买单！
-        # distance_to_msb = max_col - cols_tensor
-        # cpa_penalty = distance_to_msb * CPA_CARRY_DELAY_PER_BIT * sink_probs
-        
-        # # 5. [核心] 带有 CPA 视野的全局有效到达时间
-        # effective_ats_tensor = all_ats_tensor + cpa_penalty
-        
-        # # 使用引入了 CPA 惩罚的 AT 来计算 Slack
-        # slacks = self.req_time - effective_ats_tensor
-        # # =========================================================================
         # =========================================================================
         # 🚀 [真实物理校准：可切换架构的 CPA 代理模型]
         # =========================================================================
@@ -348,56 +322,6 @@ class DOMAC_CompressorTree(nn.Module):
         # 4. 利用全链路时序计算最终的 Slack
         slacks = self.req_time - effective_ats_tensor
         # =========================================================================
-        
-
-# # =========================================================================
-#         # 🚀 [真实物理校准：可切换架构的 CPA 代理模型 (DOMAC 28nm 精确版)]
-#         # =========================================================================
-#         # 1. 计算每个节点流向外部 CPA (Sink) 的连续概率
-#         # M_internal 形状为 [num_nodes, total_comp_pins]
-#         # 如果一个节点没有100%连接到压缩器，剩余的概率视作流向了底部的 CPA
-#         sink_probs = 1.0 - torch.sum(M_internal, dim=1)
-#         sink_probs = torch.clamp(sink_probs, min=0.0, max=1.0)
-        
-#         # 2. 基于 2026-03 DC 综合报告提取的绝对真实参数 (TSMC 28nm ZeroWireload)
-#         # --- 行波进位 (RCA) 模式 ---
-#         CPA_BIT_DELAY_RCA = 0.040      # 从报告得出: FA 的 CI->CO 稳定在 0.04ns
-#         CPA_BASE_DELAY_RCA = 0.100     # 注入端(A->CO 0.06ns) + 提取端(S+MUX 0.04ns) = 0.10ns
-        
-#         # --- 前缀树 (Prefix Tree) 模式 ---
-#         CPA_TREE_STAGE_DELAY = 0.035   # 高速前缀树(Kogge-Stone)单级复合门延迟预估
-#         CPA_BASE_DELAY_TREE = 0.060    # 树形加法器的基础进出延迟
-
-#         # 3. 计算到达 MSB 的物理距离 (决定了 Ripple Chain 的长度)
-#         # 乘法器的最终 MSB (Highest Bit) 取决于位宽
-#         max_col = max(self.node_cols) 
-#         cols_tensor = torch.tensor(self.node_cols, dtype=torch.float32, device=all_ats_tensor.device)
-        
-#         # 距离 = MSB - 当前节点所在列 (clamp 确保安全，防止负数和 log2(0))
-#         distance_to_msb = torch.clamp(max_col - cols_tensor, min=0.0)
-        
-#         # =======================================================
-#         # 模式切换开关：如果未来综合脚本开启了超级前缀树，改为 'PREFIX_TREE'
-#         # =======================================================
-#         CPA_ARCHITECTURE = 'RCA' 
-        
-#         if CPA_ARCHITECTURE == 'RCA':
-#             # O(N) 线性惩罚模型，完美契合目前网表生成的行波进位特征
-#             cpa_latency = CPA_BASE_DELAY_RCA + distance_to_msb * CPA_BIT_DELAY_RCA
-#         else:
-#             # O(log2(N)) 对数模型，代表 DesignWare 里的顶级综合结果
-#             cpa_latency = CPA_BASE_DELAY_TREE + CPA_TREE_STAGE_DELAY * torch.log2(distance_to_msb + 1.0)
-            
-#         # 4. 计算 CPA 综合惩罚 (软化处理)
-#         # 只有真正流向 Sink 的那部分概率，才会被施加 CPA 的长路径惩罚
-#         cpa_penalty = cpa_latency * sink_probs
-        
-#         # 5. 融合 CPA 惩罚后的全局有效到达时间 (Effective Arrival Time)
-#         effective_ats_tensor = all_ats_tensor + cpa_penalty
-        
-#         # 6. 利用全链路时序计算最终的 Slack
-#         slacks = self.req_time - effective_ats_tensor
-#         # =========================================================================
         
         negative_slacks = torch.clamp(slacks, max=0.0)
         

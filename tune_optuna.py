@@ -137,18 +137,18 @@ def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_co
 
     def objective(trial):
         param_combination = {
-            't1': 1,     # WNS 权重拉到极致，逼迫网络突破延迟极限
-            't2': 0.4,       # TNS 辅助全局路径寻优
-            'alpha': 1,    # 【封印】前期绝对不许管面积！
-            'lambda1': 0.68,  # 连线合法性是必须的
-            'lambda2': 0.54,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+            't1': trial.suggest_float('t1', 1, 4, step=0.1),       
+            't2': trial.suggest_float('t2', 0.05, 0.5 ,step=0.05),  
+            'alpha':trial.suggest_float('alpha', 0.1, 2 ,step=0.1),  
+            'lambda1': trial.suggest_float('lambda1', 0.02, 0.7, step=0.02), 
+            'lambda2': trial.suggest_float('lambda2', 0.02, 0.7, step=0.02),
             'tau_k':0.995,
-            'beta': 0.0015,     # 新增：毛刺功耗权重，适度关注毛刺下降但不至于过早牺牲性能
             'seed': 42,
-            'max_epochs': trial.suggest_int('max_epochs', 200, 600, step=10),
+            'max_epochs':300,
             'init_noise_std': 0.01,
+            'beta':0,  # 新增：毛刺功耗权重，适度关注毛刺下降但不至于过早牺牲性能
             # 【新增】把学习率交给贝叶斯寻优，搜索区间 0.01 到 0.1
-            'lr':trial.suggest_float('lr', 0.001,1,log=True)
+            'lr': 0.05
         }
         
         # param_combination = {
@@ -279,7 +279,7 @@ def main():
     TARGET_WEIGHTS = {
         'wns': 1, 
         'area': 0.0000, 
-        'glitch': 1.0 
+        'glitch': 0 
     }
     
     print(f" [Target] 当前优化目标权重: WNS({TARGET_WEIGHTS.get('wns', 0)}), Area({TARGET_WEIGHTS.get('area', 0)}), Glitch({TARGET_WEIGHTS.get('glitch', 0)})")
