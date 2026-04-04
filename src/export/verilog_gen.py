@@ -37,7 +37,7 @@ class VerilogGenerator:
             row_sums = torch.sum(discrete_M, dim=1).tolist()
             
             for i in range(total_nodes):
-                if row_sums[i] == 0: 
+                if row_sums[i] < 0.5: 
                     if i < self.num_pp:
                         out_name = f"out_pp_{i}"
                         output_ports.append(out_name)

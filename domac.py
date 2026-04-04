@@ -33,7 +33,8 @@ else:
         generate_dadda_init_matrix,
         probe_column_height_overflow,
         probe_post_legalization_eval,
-        probe_wavefront_at
+        probe_wavefront_at,
+        build_local_routing_graph
     )
 
 def main():
@@ -126,67 +127,49 @@ def main():
     BASELINE_GATE_INDEX = 1 
     safe_gate_idx = BASELINE_GATE_INDEX if max_impls > BASELINE_GATE_INDEX else 0
 
+    # =======================================================
+    # 替换 2：净化初始化逻辑，彻底移除没用的旧版全局矩阵
+    # =======================================================
+    init_p = None
     if INIT_MODE == 'dadda':
-        print(f" -> [Init] 采用 Dadda 树先验知识热启动 (物理门初始尺寸: D{safe_gate_idx})")
-        init_m = generate_dadda_init_matrix(BIT_WIDTH, PP_COLS, COMP_COLS, C_TYPES)
+        print(f" -> [Init] 采用 Dadda 树物理先验热启动 (物理门初始尺寸: D{safe_gate_idx})")
         init_p = torch.zeros((NUM_COMPRESSORS, max_impls))
         init_p[:, safe_gate_idx] = 10.0  
-        
-        discrete_init_M = torch.zeros_like(init_m)
-        discrete_init_M[:, :-1] = (init_m[:, :-1] == 10.0).float() 
-        discrete_init_P = [safe_gate_idx] * NUM_COMPRESSORS
-
     elif INIT_MODE == 'blank':
-        # print(f" -> [Init] 采用等概率全零矩阵冷启动 (无先验知识)")
-        # total_nodes = NUM_PP + 2 * NUM_COMPRESSORS
-        # total_target_pins = NUM_COMPRESSORS * 3
-        # init_m = torch.zeros((total_nodes, total_target_pins + 1))
-        # init_p = torch.zeros((NUM_COMPRESSORS, max_impls))
-        
-        print(f" -> [Init] 采用纯随机高斯噪声冷启动 (打破拓扑对称性)")
-        total_nodes = NUM_PP + 2 * NUM_COMPRESSORS
-        total_target_pins = NUM_COMPRESSORS * 3
-        # 【致命修复】绝不能用 zeros！必须用正态分布噪声打破梯度对称性
-        FIXED_SEED = 42 
-        torch.manual_seed(FIXED_SEED)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(FIXED_SEED)
-        init_m = torch.randn((total_nodes, total_target_pins + 1)) * 0.01
+        print(f" -> [Init] 采用纯随机冷启动 (拓扑随机，物理门随机)")
         init_p = torch.zeros((NUM_COMPRESSORS, max_impls))
-        
-    else:
-        raise ValueError(f"[Fatal] 未知的初始化模式: {INIT_MODE}")
-        
+
+    routing_stages, total_virtual_nodes = build_local_routing_graph(BIT_WIDTH, PP_COLS, COMP_COLS, C_TYPES)
+
     model = DOMAC_CompressorTree(
         PP_COLS, COMP_COLS, fa_tensors, ha_tensors, C_TYPES, REQ_TIME, 
-        device=device,
-        init_m_logits=init_m, 
-        init_p_logits=init_p
+        routing_stages=routing_stages,
+        total_virtual_nodes=total_virtual_nodes,
+        init_mode=INIT_MODE,   
+        init_p_logits=init_p,  # <--- 修复：完美注入物理先验
+        device=device
     ).to(device)
 
-    loss_engine = DOMACLossFunction(target_sink_count=TARGET_SINK_COUNT)
+    loss_engine = DOMACLossFunction()
     trainer = DOMACTrainer(model, loss_engine, lr=0.066)
     
     print("\n[Engine] 物理映射与梯度反向传播开始...")
-    
     start_time = time.time()
-    final_M, final_P = trainer.train(pp_at, pp_slew, max_epochs=270)
+    final_local_M, final_P = trainer.train(pp_at, pp_slew, max_epochs=270)
     
     print("\n[System] 优化执行完毕！网表拓扑已坍缩至离散界限附近。")
     
     legalizer = DOMACLegalizer()
-    discrete_M, discrete_P = legalizer.legalize(final_M, final_P, C_TYPES, model.dag_mask)
+    discrete_local_M, discrete_P, global_M = legalizer.legalize(
+        final_local_M, final_P, model.local_meta, NUM_PP, NUM_COMPRESSORS
+    )
     
-    # # ================= [探针 1：列高溢出探针] =================
-    # probe_column_height_overflow(model, discrete_M)
-    # # ==========================================================
-
-    # ================= [探针 2：离散化后硬连线物理评估 & WNS 溯源探针] =================
+    # ================= [探针区] =================
     probe_post_legalization_eval(
         model=model, 
         loss_engine=loss_engine, 
         trainer_hyperparams=trainer.hyperparams, 
-        discrete_M=discrete_M, 
+        discrete_local_M=discrete_local_M,  
         discrete_P=discrete_P, 
         final_P=final_P, 
         pp_at=pp_at, 
@@ -196,45 +179,34 @@ def main():
         COMP_COLS=COMP_COLS
     )
 
-    # ================= [探针 3：波前到达时间 (Wavefront AT) 探针] =================
-    probe_wavefront_at(model=model, discrete_M=discrete_M)
+    probe_wavefront_at(model=model, discrete_M=global_M[:, :-1])
 
-    # ==============================================================================
-
+    # =======================================================
+    # 替换 3：重组网表生成逻辑，直接调用原生 Baseline 发生器
+    # =======================================================
     os.makedirs("output/netlists", exist_ok=True)
-    
     v_gen = VerilogGenerator(
-        pp_cols=PP_COLS, 
-        c_cols=COMP_COLS,
-        c_types=C_TYPES,
-        fa_cell_names=fa_names,
-        ha_cell_names=ha_names
+        pp_cols=PP_COLS, c_cols=COMP_COLS, c_types=C_TYPES,
+        fa_cell_names=fa_names, ha_cell_names=ha_names
     )
     
     netlist_path = f"output/netlists/domac_tree_{BIT_WIDTH}.v"
-    # tb_path = "output/netlists/tb_domac_.v"
-    
-    v_gen.generate(discrete_M, discrete_P, output_file=netlist_path)
-    # v_gen.generate_testbench(tb_file=tb_path, netlist_file=netlist_path)
+    v_gen.generate(global_M[:, :-1], discrete_P, output_file=netlist_path)
     
     top_path = f"output/netlists/domac_{BIT_WIDTH}.v"
     v_gen.generate_multiplier_top(
-        bit_width=BIT_WIDTH, 
-        top_file=top_path, 
-        ct_module_name="domac_tree", 
-        top_module_name="domac"
+        bit_width=BIT_WIDTH, top_file=top_path, 
+        ct_module_name="domac_tree", top_module_name="domac"
     )
-    if INIT_MODE == 'dadda' and discrete_init_M is not None:
-        print(f"\n[BaselineGen] 正在直接从 AI 热启动矩阵中剥离 {INIT_MODE} 基准网表 (保证 100% 对齐)...")
-        v_gen.module_name = f"{INIT_MODE}_tree"
-        v_gen.generate(discrete_init_M, discrete_init_P, output_file=f"output/netlists/{INIT_MODE}_tree_{BIT_WIDTH}.v")
-        v_gen.generate_multiplier_top(
+    
+    # 极简、安全的基准网表生成
+    if INIT_MODE == 'dadda':
+        print(f"\n[BaselineGen] 正在直接从架构底层推演纯血 Dadda 基准网表...")
+        v_gen.generate_pure_dadda_baseline(
             bit_width=BIT_WIDTH,
-            top_file=f"output/netlists/{INIT_MODE}_{BIT_WIDTH}.v",
-            ct_module_name=f"{INIT_MODE}_tree",
-            top_module_name=f"{INIT_MODE}"
+            output_file=f"output/netlists/{INIT_MODE}_tree_{BIT_WIDTH}.v",
+            top_file=f"output/netlists/{INIT_MODE}_{BIT_WIDTH}.v"
         )
-        v_gen.module_name = "dadda_tree"
     else:
         print(f"\n[BaselineGen] 当前为 '{INIT_MODE}' 冷启动模式，跳过生成基准对照组网表。")
 

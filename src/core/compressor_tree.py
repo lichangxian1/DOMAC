@@ -4,10 +4,9 @@ import torch.nn.functional as F
 from .diff_sta import smooth_max_lse, diff_bilinear_interp
 
 class DOMAC_CompressorTree(nn.Module):
-    # 1. 在初始化参数中加入 device
-    # def __init__(self, pp_cols, c_cols, fa_tensors, ha_tensors, c_types, req_time, device='cpu'):
-    #     super(DOMAC_CompressorTree, self).__init__()
-    def __init__(self, pp_cols, c_cols, fa_tensors, ha_tensors, c_types, req_time, device='cpu', init_m_logits=None, init_p_logits=None):
+    # 注意：接口中去掉了无用的 init_m_logits，新增了 routing_stages, total_virtual_nodes 和 init_mode
+    def __init__(self, pp_cols, c_cols, fa_tensors, ha_tensors, c_types, req_time, 
+                 routing_stages, total_virtual_nodes, init_mode='blank', device='cpu', init_p_logits=None):
         super(DOMAC_CompressorTree, self).__init__()
         self.device = device  # <--- [核心新增] 记住目标设备
         self.pp_cols = pp_cols
@@ -15,73 +14,83 @@ class DOMAC_CompressorTree(nn.Module):
         self.num_pp = len(pp_cols)
         self.num_c = len(c_cols)
         self.c_types = c_types
-        
-        self.s_cols = c_cols
-        self.co_cols = [col + 1 for col in c_cols] 
-        self.node_cols = list(self.pp_cols) + list(self.s_cols) + list(self.co_cols)
-        total_nodes = len(self.node_cols)
-        
-        self.num_fa_impls = len(fa_tensors)
-        self.num_ha_impls = len(ha_tensors)
-        self.max_impls = max(self.num_fa_impls, self.num_ha_impls)
         self.req_time = req_time
+        
+        # 记录所有虚拟节点的列权重 (Column)，供最终 CPA 惩罚使用
+        self.total_virtual_nodes = total_virtual_nodes
+        self.virtual_node_cols = torch.zeros(self.total_virtual_nodes, dtype=torch.long, device=device)
+        self.virtual_node_cols[:self.num_pp] = torch.tensor(pp_cols, device=device)
+        self.virtual_node_cols[self.num_pp : self.num_pp+self.num_c] = torch.tensor(c_cols, device=device)
+        self.virtual_node_cols[self.num_pp+self.num_c : self.num_pp+2*self.num_c] = torch.tensor([c+1 for c in c_cols], device=device)
         
         self.pin_names = ['A', 'B', 'CI']
         self.num_pins_per_c = len(self.pin_names)
         
-        # 预编译为 3D 张量的物理库 (现在会在解析时直接上 GPU)
+        # 1. 预编译为 3D 张量的物理库
         self.fa_areas, self.fa_caps, self.fa_arcs = self._parse_tensors(fa_tensors)
         self.ha_areas, self.ha_caps, self.ha_arcs = self._parse_tensors(ha_tensors)
+        self.num_fa_impls = len(fa_tensors)
+        self.num_ha_impls = len(ha_tensors)
+        self.max_impls = max(self.num_fa_impls, self.num_ha_impls)
         
-        # ... 后续的 p_logits, dag_mask 等代码保持不变 ...
-        # self.p_logits = nn.Parameter(torch.zeros(self.num_c, self.max_impls))
+        # 2. 物理实现选取器 P_c (保持全局映射)
         if init_p_logits is not None:
             self.p_logits = nn.Parameter(init_p_logits.clone().to(device))
         else:
             self.p_logits = nn.Parameter(torch.zeros(self.num_c, self.max_impls, device=device))
-        
-        p_mask = torch.zeros(self.num_c, self.max_impls)
-        active_pin_mask = torch.zeros(self.num_c * self.num_pins_per_c)
-        
+            
+        p_mask = torch.zeros(self.num_c, self.max_impls, device=device)
         for j, c_type in enumerate(self.c_types):
             if c_type == 'FA':
                 p_mask[j, self.num_fa_impls:] = float('-inf')
-                active_pin_mask[j*3 : j*3+3] = 1.0
             else:
                 p_mask[j, self.num_ha_impls:] = float('-inf')
-                active_pin_mask[j*3 : j*3+2] = 1.0
-                active_pin_mask[j*3+2] = 0.0
-                
         self.register_buffer('p_mask', p_mask)
-        self.register_buffer('active_pin_mask', active_pin_mask)
         
-        # total_target_pins = self.num_c * self.num_pins_per_c 
-        # self.m_logits = nn.Parameter(torch.zeros(total_nodes, total_target_pins + 1))
-        total_target_pins = self.num_c * self.num_pins_per_c 
-        if init_m_logits is not None:
-            # 采用传入的热启动矩阵
-            self.m_logits = nn.Parameter(init_m_logits.clone().to(device))
-        else:
-            # 原本的白板初始化
-            self.m_logits = nn.Parameter(torch.zeros(total_nodes, total_target_pins + 1, device=device))
-            
-        dag_mask = torch.full((total_nodes, total_target_pins + 1), float('-inf'))
-        for i in range(total_nodes):
-            for j in range(self.num_c):
-                if i < self.num_pp:
-                    is_downstream = True
-                elif i < self.num_pp + self.num_c:
-                    is_downstream = (i - self.num_pp) < j
-                else:
-                    is_downstream = (i - self.num_pp - self.num_c) < j
-
-                if is_downstream and (self.node_cols[i] == self.c_cols[j]):
-                    for p_idx in range(self.num_pins_per_c):
-                        if self.active_pin_mask[j * 3 + p_idx] > 0.5:
-                            dag_mask[i, j * self.num_pins_per_c + p_idx] = 0.0
-            dag_mask[i, total_target_pins] = 0.0 
-            
-        self.register_buffer('dag_mask', dag_mask)
+        # =========================================================================
+        # 🚀 [架构重构] 注册局部级联矩阵群 (Local Matrix ParameterList)
+        # =========================================================================
+        self.local_m_logits = nn.ParameterList()
+        self.local_meta = []
+        
+        for stage_meta in routing_stages:
+            for meta in stage_meta:
+                num_in = len(meta['in_wires'])
+                num_pins = len(meta['pin_global_indices'])
+                num_bypass = len(meta['out_bypass_ids'])
+                num_out_cols = num_pins + num_bypass
+                
+                # 记录 Bypass 虚拟线的位权
+                col = meta['col']
+                for b_id in meta['out_bypass_ids']:
+                    self.virtual_node_cols[b_id] = col
+                    
+                if num_in > 0 and num_out_cols > 0:
+                    # [极简热启动] 如果是 Dadda 模式，直接用单位矩阵主对角线硬连线！
+                    if init_mode == 'dadda' and num_in == num_out_cols:
+                        m_ij = nn.Parameter(torch.eye(num_in, num_out_cols, device=device) * 10.0)
+                    else:
+                        m_ij = nn.Parameter(torch.randn(num_in, num_out_cols, device=device) * 0.01)
+                        
+                    self.local_m_logits.append(m_ij)
+                    
+                    # 存储元数据以供前向传播查表
+                    self.local_meta.append({
+                        'in_wires': meta['in_wires'],
+                        'fa_ids': meta['fa_ids'],
+                        'ha_ids': meta['ha_ids'],
+                        'out_bypass_ids': meta['out_bypass_ids'],
+                        'pin_global_indices': meta['pin_global_indices'],
+                        'matrix_idx': len(self.local_m_logits) - 1,
+                        'num_pins': num_pins,
+                        'num_bypass': num_bypass
+                    })
+        # ========== [请在 __init__ 的最后补充这几行] ==========
+        active_pin_mask = torch.zeros(self.num_c * self.num_pins_per_c, device=device)
+        for j, c_type in enumerate(self.c_types):
+            if c_type == 'FA': active_pin_mask[j*3 : j*3+3] = 1.0
+            else: active_pin_mask[j*3 : j*3+2] = 1.0
+        self.register_buffer('active_pin_mask', active_pin_mask)
 
     def _parse_tensors(self, tensors):
         areas, caps = [], []
@@ -117,10 +126,10 @@ class DOMAC_CompressorTree(nn.Module):
         #             else:
         #                 stacked_arcs[out_p][in_p]['delay_lut'].append(torch.full((7,7), 10.0))
         #                 stacked_arcs[out_p][in_p]['slew_lut'].append(torch.full((7,7), 10.0))
-        for ct_idx, ct in enumerate(tensors):
             # ==========================================================
             # 1. 严格面积审查 (拒绝默认值 1.0)
             # ==========================================================
+        for ct_idx, ct in enumerate(tensors):
             if 'cell_area' not in ct:
                 raise ValueError(f"[Fatal] 物理库审查失败: 传入的第 {ct_idx} 个单元缺失面积(cell_area)数据！")
             areas.append(ct['cell_area'])
@@ -173,192 +182,184 @@ class DOMAC_CompressorTree(nn.Module):
     def forward(self, pp_at, pp_slew, tau=1.0):
         # 【核心修改】将 logits 除以温度 tau，tau 越小，概率越向 0/1 极化！
         P_c = F.softmax((self.p_logits + self.p_mask) / tau, dim=-1) 
-        M_full = F.softmax((self.m_logits + self.dag_mask) / tau, dim=-1) 
-        M_internal = M_full[:, :-1]
-            
+        
+        # 1. 提前计算所有物理压缩器的输入引脚期望电容与面积
+        global_pin_caps = torch.zeros(self.num_c * 3, device=self.device)
+
         expected_area = 0.0
-        expected_pin_caps_list = []
 
         for j, c_type in enumerate(self.c_types):
             is_fa = (c_type == 'FA')
             lib_areas = self.fa_areas if is_fa else self.ha_areas
             lib_caps = self.fa_caps if is_fa else self.ha_caps
-            
+
             p_j = P_c[j, :self.num_fa_impls] if is_fa else P_c[j, :self.num_ha_impls]
-            expected_area = expected_area + torch.sum(p_j * lib_areas.to(P_c.device))
             
-            c_caps = p_j @ lib_caps.to(P_c.device)
-            expected_pin_caps_list.append(c_caps)
-            
-        flat_expected_pin_caps = torch.cat(expected_pin_caps_list)
+            expected_area = expected_area + torch.sum(p_j * lib_areas)
+            global_pin_caps[j*3 : j*3+3] = p_j @ lib_caps
+
+        # 2. 从后向前计算反向导线电容负载 (Backward Load Propagation)
+        # 这完美解决了局部矩阵架构下跨级连线的负载溯源问题
+        node_loads = torch.zeros(self.total_virtual_nodes, device=self.device)
         # ================= [核心物理修复：引入线负载模型 WLM] =================
         # 假设 TSMC 28nm 下，一根跨 Cell 互连线的平均寄生电容约为 0.003 pF (3 fF)
         # 你可以根据实际库的情况微调这个值
         WIRE_CAP_PER_NET = 0.000 
         
-        # 原逻辑：loads = M_internal @ flat_expected_pin_caps
-        # 新逻辑：只要存在连线（M_internal），就必须附加上导线的寄生电容！
-        # loads = M_internal @ flat_expected_pin_caps + M_internal * WIRE_CAP_PER_NET
-        # 修改 src/core/compressor_tree.py 第 201 行左右
-        loads = M_internal @ (flat_expected_pin_caps + WIRE_CAP_PER_NET)
-        # ====================================================================
-        # loads = M_internal @ flat_expected_pin_caps 
+        local_M_probs = [F.softmax(m / tau, dim=1) for m in self.local_m_logits]
         
-        # =========================================================================
-        # [Dr. Gemini 降维打击：Push 前向广播范式]
-        # 1. 初始时刻：只利用外部输入的 PP 信号，一波推给压缩树的所有引脚进行打底！
-        m_pp_all = M_internal[:self.num_pp, :]
-        pin_ats_all = pp_at @ m_pp_all
-        pin_slews_all = pp_slew @ m_pp_all
-        # =========================================================================
+        for meta in reversed(self.local_meta):
+            M_ij = local_M_probs[meta['matrix_idx']]
+            target_caps = torch.zeros(meta['num_pins'] + meta['num_bypass'], device=self.device)
+            
+            if meta['num_pins'] > 0:
+                target_caps[:meta['num_pins']] = global_pin_caps[meta['pin_global_indices']]
+            if meta['num_bypass'] > 0:
+                target_caps[meta['num_pins']:] = node_loads[meta['out_bypass_ids']]
+                
+            in_wire_loads = M_ij @ (target_caps + WIRE_CAP_PER_NET)
+            for idx, w in enumerate(meta['in_wires']):
+                node_loads[w] += in_wire_loads[idx]
 
-        s_ats, s_slews = [], []
-        co_ats, co_slews = [], []
+        # 3. 前向波前推进 (Forward Wavefront Propagation)
+        wire_ats = torch.zeros(self.total_virtual_nodes, device=self.device)
+        wire_slews = torch.zeros(self.total_virtual_nodes, device=self.device)
+        
+        wire_ats[:self.num_pp] = pp_at
+        wire_slews[:self.num_pp] = pp_slew
+        
+        expected_glitch = 0.0
+        global_pin_ats_probe = torch.zeros(self.num_c * 3, device=self.device)
 
-        for j in range(self.num_c):
-            col_start = j * self.num_pins_per_c
-            col_end = col_start + self.num_pins_per_c
+        # 严格按级逐列遍历，彻底封死越级通道
+        for meta in self.local_meta:
+            M_ij = local_M_probs[meta['matrix_idx']]
+            in_w = meta['in_wires']
             
-            # 2. 坐享其成：当前压缩器的输入引脚时序，早已被前面的兄弟计算好并推送过来了！
-            # 彻底消灭了 O(N^2) 的 torch.stack 和切片！
-            pin_ats = pin_ats_all[col_start:col_end]
-            pin_slews = pin_slews_all[col_start:col_end]
-
-            s_load = loads[self.num_pp + j]
-            co_load = loads[self.num_pp + self.num_c + j]
+            in_ats = wire_ats[in_w]
+            in_slews = wire_slews[in_w]
             
-            is_fa = (self.c_types[j] == 'FA')
-            cell_arcs = self.fa_arcs if is_fa else self.ha_arcs
-            P_j = P_c[j, :self.num_fa_impls] if is_fa else P_c[j, :self.num_ha_impls]
+            # 张量广播推流
+            routed_ats = in_ats @ M_ij
+            routed_slews = in_slews @ M_ij
             
-            s_paths_at, s_paths_slew = [], []
-            co_paths_at, co_paths_slew = [], []
+            num_pins = meta['num_pins']
+            num_bypass = meta['num_bypass']
             
-            for p_idx, p_name in enumerate(self.pin_names):
-                if self.active_pin_mask[j * 3 + p_idx] > 0.5:
+            # 3.1 处理 Bypass 透传线
+            if num_bypass > 0:
+                out_b_ids = meta['out_bypass_ids']
+                wire_ats[out_b_ids] = routed_ats[num_pins:]
+                wire_slews[out_b_ids] = routed_slews[num_pins:]
+                
+            # 3.2 处理压缩器物理计算
+            pin_ats = routed_ats[:num_pins]
+            pin_slews = routed_slews[:num_pins]
+            
+            if num_pins > 0:
+                global_pin_ats_probe[meta['pin_global_indices']] = pin_ats
+            
+            pin_offset = 0
+            
+            # 全加器
+            for c_id in meta['fa_ids']:
+                p_j = P_c[c_id, :self.num_fa_impls]
+                c_ats = pin_ats[pin_offset : pin_offset+3]
+                c_slews = pin_slews[pin_offset : pin_offset+3]
+                pin_offset += 3
+                
+                # 💥 极其纯粹的 Glitch Variance
+                mean_at = torch.mean(c_ats)
+                expected_glitch = expected_glitch + torch.sqrt(torch.sum((c_ats - mean_at)**2) + 1e-8)
+                
+                s_load = node_loads[self.num_pp + c_id]
+                co_load = node_loads[self.num_pp + self.num_c + c_id]
+                
+                s_paths_at, s_paths_slew = [], []
+                co_paths_at, co_paths_slew = [], []
+                
+                for p_idx, p_name in enumerate(['A', 'B', 'CI']):
+                    arc_S = self.fa_arcs['S'][p_name]
+                    d_S = diff_bilinear_interp(c_slews[p_idx], s_load, arc_S['index_1_slew'], arc_S['index_2_load'], arc_S['delay_lut'])
+                    sl_S = diff_bilinear_interp(c_slews[p_idx], s_load, arc_S['index_1_slew'], arc_S['index_2_load'], arc_S['slew_lut'])
+                    s_paths_at.append(c_ats[p_idx] + torch.sum(p_j * d_S))
+                    s_paths_slew.append(torch.sum(p_j * sl_S))
                     
-                    arc_S = cell_arcs['S'][p_name]
-                    delays_S = diff_bilinear_interp(pin_slews[p_idx], s_load, arc_S['index_1_slew'], arc_S['index_2_load'], arc_S['delay_lut'])
-                    slews_S = diff_bilinear_interp(pin_slews[p_idx], s_load, arc_S['index_1_slew'], arc_S['index_2_load'], arc_S['slew_lut'])
+                    arc_CO = self.fa_arcs['CO'][p_name]
+                    d_CO = diff_bilinear_interp(c_slews[p_idx], co_load, arc_CO['index_1_slew'], arc_CO['index_2_load'], arc_CO['delay_lut'])
+                    sl_CO = diff_bilinear_interp(c_slews[p_idx], co_load, arc_CO['index_1_slew'], arc_CO['index_2_load'], arc_CO['slew_lut'])
+                    co_paths_at.append(c_ats[p_idx] + torch.sum(p_j * d_CO))
+                    co_paths_slew.append(torch.sum(p_j * sl_CO))
                     
-                    s_paths_at.append(pin_ats[p_idx] + torch.sum(P_j * delays_S))
-                    s_paths_slew.append(torch.sum(P_j * slews_S))
-                    
-                    arc_CO = cell_arcs['CO'][p_name]
-                    delays_CO = diff_bilinear_interp(pin_slews[p_idx], co_load, arc_CO['index_1_slew'], arc_CO['index_2_load'], arc_CO['delay_lut'])
-                    slews_CO = diff_bilinear_interp(pin_slews[p_idx], co_load, arc_CO['index_1_slew'], arc_CO['index_2_load'], arc_CO['slew_lut'])
-                    
-                    co_paths_at.append(pin_ats[p_idx] + torch.sum(P_j * delays_CO))
-                    co_paths_slew.append(torch.sum(P_j * slews_CO))
+                wire_ats[self.num_pp + c_id] = smooth_max_lse(s_paths_at, gamma=0.01)
+                wire_slews[self.num_pp + c_id] = smooth_max_lse(s_paths_slew, gamma=0.01)
+                wire_ats[self.num_pp + self.num_c + c_id] = smooth_max_lse(co_paths_at, gamma=0.01)
+                wire_slews[self.num_pp + self.num_c + c_id] = smooth_max_lse(co_paths_slew, gamma=0.01)
 
-            # expected_s_at = smooth_max_lse(s_paths_at, gamma=0.01) if s_paths_at else torch.tensor(10.0, device=P_c.device)
-            # expected_s_slew = smooth_max_lse(s_paths_slew, gamma=0.01) if s_paths_at else torch.tensor(10.0, device=P_c.device)
-            # expected_co_at = smooth_max_lse(co_paths_at, gamma=0.01) if co_paths_at else torch.tensor(10.0, device=P_c.device)
-            # expected_co_slew = smooth_max_lse(co_paths_slew, gamma=0.01) if co_paths_at else torch.tensor(10.0, device=P_c.device)
-            # 如果某输出引脚没有任何合法输入路径，到达时间应当是 0.0 而不是惩罚性的 10.0ns
-            expected_s_at = smooth_max_lse(s_paths_at, gamma=0.01) if s_paths_at else torch.tensor(0.0, device=P_c.device)
-            expected_s_slew = smooth_max_lse(s_paths_slew, gamma=0.01) if s_paths_slew else torch.tensor(0.0, device=P_c.device)
-            expected_co_at = smooth_max_lse(co_paths_at, gamma=0.01) if co_paths_at else torch.tensor(0.0, device=P_c.device)
-            expected_co_slew = smooth_max_lse(co_paths_slew, gamma=0.01) if co_paths_slew else torch.tensor(0.0, device=P_c.device)
-            # =========================================================================
-            # 3. [核弹级推送] 本节点算完后，直接通过 M_internal 一波推给所有未来的潜在下游引脚！
-            # a = a + b 是安全的 out-of-place 加法，完美保留 Autograd 梯度！
-            pin_ats_all = pin_ats_all + expected_s_at * M_internal[self.num_pp + j, :]
-            pin_slews_all = pin_slews_all + expected_s_slew * M_internal[self.num_pp + j, :]
-            
-            pin_ats_all = pin_ats_all + expected_co_at * M_internal[self.num_pp + self.num_c + j, :]
-            pin_slews_all = pin_slews_all + expected_co_slew * M_internal[self.num_pp + self.num_c + j, :]
-            # =========================================================================
-            
-            s_ats.append(expected_s_at)
-            s_slews.append(expected_s_slew)
-            co_ats.append(expected_co_at)
-            co_slews.append(expected_co_slew)
-            
-        # 完美拼接，彻底消灭 list of tensors 导致的 O(N) 性能雪崩
-        s_ats_t = torch.stack(s_ats)
-        co_ats_t = torch.stack(co_ats)
-        all_ats_tensor = torch.cat([pp_at, s_ats_t, co_ats_t])
-        
-        slacks = self.req_time - all_ats_tensor
-        
-        # =========================================================================
-        # 🚀 [真实物理校准：可切换架构的 CPA 代理模型]
-        # =========================================================================
-        # 1. 计算每个节点流向外部 CPA (Sink) 的连续概率
-        sink_probs = 1.0 - torch.sum(M_internal, dim=1)
-        sink_probs = torch.clamp(sink_probs, min=0.0, max=1.0)
-        
-        # 2. 基于 2026-03 DC 综合报告提取的绝对真实参数
-        CPA_BIT_DELAY_RCA = 0.040      # 从报告得出: CI->CO 稳定在 0.04ns
-        CPA_BASE_DELAY_RCA = 0.090     # 首位 HA + 末位 S 输出的固定开销
-        
-        CPA_TREE_STAGE_DELAY = 0.035   # 高速前缀树(Kogge-Stone)单级延迟预估
-        CPA_BASE_DELAY_TREE = 0.055    # 树形加法器的基础进入延迟
+            # 半加器
+            for c_id in meta['ha_ids']:
+                p_j = P_c[c_id, :self.num_ha_impls]
+                c_ats = pin_ats[pin_offset : pin_offset+2]
+                c_slews = pin_slews[pin_offset : pin_offset+2]
+                pin_offset += 2
+                
+                mean_at = torch.mean(c_ats)
+                expected_glitch = expected_glitch + torch.sqrt(torch.sum((c_ats - mean_at)**2) + 1e-8)
+                
+                s_load = node_loads[self.num_pp + c_id]
+                co_load = node_loads[self.num_pp + self.num_c + c_id]
+                
+                s_paths_at, s_paths_slew = [], []
+                co_paths_at, co_paths_slew = [], []
+                
+                for p_idx, p_name in enumerate(['A', 'B']):
+                    arc_S = self.ha_arcs['S'][p_name]
+                    d_S = diff_bilinear_interp(c_slews[p_idx], s_load, arc_S['index_1_slew'], arc_S['index_2_load'], arc_S['delay_lut'])
+                    sl_S = diff_bilinear_interp(c_slews[p_idx], s_load, arc_S['index_1_slew'], arc_S['index_2_load'], arc_S['slew_lut'])
+                    s_paths_at.append(c_ats[p_idx] + torch.sum(p_j * d_S))
+                    s_paths_slew.append(torch.sum(p_j * sl_S))
+                    
+                    arc_CO = self.ha_arcs['CO'][p_name]
+                    d_CO = diff_bilinear_interp(c_slews[p_idx], co_load, arc_CO['index_1_slew'], arc_CO['index_2_load'], arc_CO['delay_lut'])
+                    sl_CO = diff_bilinear_interp(c_slews[p_idx], co_load, arc_CO['index_1_slew'], arc_CO['index_2_load'], arc_CO['slew_lut'])
+                    co_paths_at.append(c_ats[p_idx] + torch.sum(p_j * d_CO))
+                    co_paths_slew.append(torch.sum(p_j * sl_CO))
+                    
+                wire_ats[self.num_pp + c_id] = smooth_max_lse(s_paths_at, gamma=0.01)
+                wire_slews[self.num_pp + c_id] = smooth_max_lse(s_paths_slew, gamma=0.01)
+                wire_ats[self.num_pp + self.num_c + c_id] = smooth_max_lse(co_paths_at, gamma=0.01)
+                wire_slews[self.num_pp + self.num_c + c_id] = smooth_max_lse(co_paths_slew, gamma=0.01)
 
-        max_col = max(self.node_cols)
-        cols_tensor = torch.tensor(self.node_cols, dtype=torch.float32, device=all_ats_tensor.device)
-        distance_to_msb = max_col - cols_tensor
-        
-        # =======================================================
-        # 模式切换开关：目前你的 DC 综合出的是 RCA，所以我们先用 RCA 模式训练！
-        # 如果你未来在 DC 里开出了前缀树，请把这里改成 'PREFIX_TREE'
-        # =======================================================
-        CPA_ARCHITECTURE = 'RCA' 
-        
-        if CPA_ARCHITECTURE == 'RCA':
-            # O(N) 线性惩罚模型，完美契合你刚刚贴出的 DC 综合网表！
-            cpa_latency = CPA_BASE_DELAY_RCA + distance_to_msb * CPA_BIT_DELAY_RCA
-        else:
-            # O(log2(N)) 对数模型，代表 DesignWare 里的顶级综合结果
-            cpa_latency = CPA_BASE_DELAY_TREE + CPA_TREE_STAGE_DELAY * torch.log2(distance_to_msb + 1.0)
+        # 4. CPA (Sink) 时序重建与惩罚
+        # 智能动态抓取：任何没有作为后续阶段 in_wires 被消耗掉的节点，必然全部流向 CPA
+        all_in_wires = set()
+        for meta in self.local_meta:
+            all_in_wires.update(meta['in_wires'])
             
-        # 计算 CPA 综合惩罚
-        cpa_penalty = cpa_latency * sink_probs
+        sink_wires = [w for w in range(self.total_virtual_nodes) if w not in all_in_wires]
+        sink_ats = wire_ats[sink_wires]
+        sink_cols = self.virtual_node_cols[sink_wires]
         
-        # 3. 融合 CPA 惩罚后的全局有效到达时间
-        effective_ats_tensor = all_ats_tensor + cpa_penalty
+        max_col = torch.max(self.virtual_node_cols)
+        distance_to_msb = max_col - sink_cols.float()
         
-        # 4. 利用全链路时序计算最终的 Slack
-        slacks = self.req_time - effective_ats_tensor
+        CPA_BIT_DELAY_RCA = 0.040 
+        CPA_BASE_DELAY_RCA = 0.090 
+        cpa_latency = CPA_BASE_DELAY_RCA + distance_to_msb * CPA_BIT_DELAY_RCA
+        
+        effective_ats = sink_ats + cpa_latency
+        slacks = self.req_time - effective_ats
         # =========================================================================
         
         negative_slacks = torch.clamp(slacks, max=0.0)
-        
+
         WNS = smooth_max_lse(-negative_slacks, gamma=0.01) 
         TNS = torch.sum(-negative_slacks)
         
         # ================= [新增：探针埋点] =================
         # 将当前周期的引脚期望AT和节点真实AT暂存，供训练探针解剖
-        self._probe_pin_ats = pin_ats_all.detach()
-        self._probe_node_ats = all_ats_tensor.detach()
-        # ====================================================
-
-        # =========================================================================
-        # ⚡ [新增核弹级特性：全图可微毛刺功耗探针 (Glitch Power Profiler)]
-        # =========================================================================
-        # 1. 将铺平的引脚 AT 张量 reshape 为 [压缩器数量, 引脚数(3)]
-        pin_ats_reshaped = pin_ats_all.view(self.num_c, self.num_pins_per_c)
-        mask_reshaped = self.active_pin_mask.view(self.num_c, self.num_pins_per_c)
+        self._probe_pin_ats = global_pin_ats_probe.detach()
+        self._probe_node_ats = wire_ats.detach()
         
-        # 2. 计算每个压缩器有效引脚的数量 (FA为3, HA为2)
-        valid_pin_count = torch.sum(mask_reshaped, dim=1, keepdim=True)
-        
-        # 3. 计算每个压缩器的局部中心到达时间 (Mean AT)
-        mean_ats = torch.sum(pin_ats_reshaped * mask_reshaped, dim=1, keepdim=True) / valid_pin_count
-        
-        # 4. 计算到达时间方差 (Variance) 
-        glitch_variance = torch.sum(mask_reshaped * (pin_ats_reshaped - mean_ats)**2, dim=1)
-        
-        # 5. [核心优化] 转化为标准差 (Standard Deviation)，拉升数值量级！
-        # ⚠️ 必须加上 1e-8 防止完美平衡时 torch.sqrt(0) 导致梯度爆炸产生 NaN！
-        glitch_std = torch.sqrt(glitch_variance + 1e-8)
-        
-        # 6. 全图总毛刺代价 (标准差之和)
-        expected_glitch = torch.sum(glitch_std)
-        # =========================================================================
-        
-        # 在 return 列表中加上 expected_glitch
-        return WNS, TNS, expected_area, expected_glitch, M_internal, P_c
-    
-        # return WNS, TNS, expected_area, M_internal, P_c
+        # 返回包含了所有局部矩阵的列表，供 objectives 和 legalizer 使用
+        return WNS, TNS, expected_area, expected_glitch, local_M_probs, P_c

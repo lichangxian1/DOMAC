@@ -19,12 +19,12 @@ class DOMACTrainer:
 
         self.hyperparams = {
             't1': 1.45,     # WNS 权重拉到极致，逼迫网络突破延迟极限
-            't2': 0.0,       # TNS 辅助全局路径寻优
-            'alpha': 0,    # 【封印】前期绝对不许管面积！
-            'lambda1': 0.0,  # 连线合法性是必须的
-            'lambda2': 0.0,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
-            'tau_k':0.995,
-            'beta': 0.00,  
+            't2': 0.4,       # TNS 辅助全局路径寻优
+            'alpha': 1,    # 【封印】前期绝对不许管面积！
+            'lambda1': 0.66,  # 连线合法性是必须的
+            'lambda2': 0.24,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+            'tau_k':0.985,
+            'beta': 0.00125,  
         }
         
         # self.hyperparams = {
@@ -50,10 +50,10 @@ class DOMACTrainer:
         elif epoch >= 200:
             self.hyperparams['t1'] *= 1.005       # 时序霸权不可动摇
             self.hyperparams['t2'] *= 1.005
-            self.hyperparams['beta'] *= 1.002     # 功耗压制转为平稳维持（防暴涨）
-            self.hyperparams['alpha'] *= 1.01     # 面积 (Area) 垫底，此时才开始发力清理冗余逻辑门
-            self.hyperparams['lambda1'] *= 1.02   # 逼近 Legalizer，增强合法性惩罚
-            self.hyperparams['lambda2'] *= 1.05   # 终极二值化施压，逼迫概率走向 0 或 1
+            self.hyperparams['beta'] = min(self.hyperparams['beta'] * 1.002, 5.0)
+            self.hyperparams['alpha'] = min(self.hyperparams['alpha'] * 1.01, 10.0) 
+            self.hyperparams['lambda1'] = min(self.hyperparams['lambda1'] * 1.02, 20.0)
+            self.hyperparams['lambda2'] = min(self.hyperparams['lambda2'] * 1.05, 50.0) 
     # def update_hyperparameters(self, epoch):
     #     """
     #     动态退火调度器：分阶段释放约束
@@ -114,17 +114,13 @@ class DOMACTrainer:
             # ================= [探针 1: 前向传播 STA] =================
             t0 = time.time()
             # wns, tns, area, M, P_c = self.model(pp_at, pp_slew)
-            wns, tns, area, glitch, M, P_c = self.model(pp_at, pp_slew, tau=current_tau)
+            wns, tns, area, glitch, local_M_probs, P_c = self.model(pp_at, pp_slew, tau=current_tau)
             t1 = time.time()
             acc_forward += (t1 - t0)
             
-            active_pin_mask = self.model.active_pin_mask
-            c_types = self.model.c_types
-            
             # ================= [探针 2: 目标与约束 Loss 计算] =================
             total_loss, loss_dict = self.loss_engine(
-                wns, tns, area,glitch, M, P_c, self.hyperparams, 
-                active_pin_mask, c_types
+                wns, tns, area, glitch, local_M_probs, P_c, self.hyperparams, self.model.local_meta
             )
             t2 = time.time()
             acc_loss += (t2 - t1)
@@ -163,54 +159,24 @@ class DOMACTrainer:
                       f"Backward: {acc_backward/div:.3f}s | "
                       f"Step: {acc_step/div:.3f}s")
                 
-                # ================= [探针：抓捕 AI 的概率稀释作弊] =================
-                # M 矩阵的 Shape 是 [总节点数, 压缩器引脚总数]
-                # 对每一列求最大值，代表该引脚最主要的信号来源所占的百分比
-                max_probs_per_pin, _ = torch.max(M, dim=0)
+# ================= [探针：抓捕 AI 的概率稀释作弊] =================
+                max_probs_list = [torch.max(m, dim=0)[0] for m in local_M_probs]
+                if max_probs_list:
+                    all_max_probs = torch.cat(max_probs_list)
+                    avg_max_prob = torch.mean(all_max_probs).item()
+                    cheating_pins = torch.sum(all_max_probs < 0.95).item()
+                else:
+                    avg_max_prob = 1.0
+                    cheating_pins = 0
+                    
+                print(f"  -> [探针] 局部矩阵最大连接概率均值: {avg_max_prob:.4f} (趋近 1.0 为纯粹硬连线)")
+                print(f"  -> [探针] 发现 {cheating_pins} 个局部引脚存在小数稀释。")
                 
-                # 统计有多少个引脚的“主来源概率”低于 0.95 (即掺杂了 >5% 的冰块信号)
-                cheating_pins = torch.sum((max_probs_per_pin < 0.95) & (active_pin_mask > 0.5)).item()
-                avg_max_prob = torch.mean(max_probs_per_pin).item()
-                
-                print(f"  -> [探针] 引脚最大连接概率均值: {avg_max_prob:.4f} (若趋近 1.0 则为纯粹硬连线)")
-                print(f"  -> [探针] 发现 {cheating_pins} 个引脚正在进行严重的小数概率稀释！")
-                
-                # 特别打印最后一个压缩器 (极有可能是贪吃蛇的末端) 的三个引脚连线概率
-                last_c_idx = P_c.shape[0] - 1
-                col_A = last_c_idx * 3 + 0
-                col_B = last_c_idx * 3 + 1
-                col_CI = last_c_idx * 3 + 2
-                print(f"  -> [探针] 末端加法器_{last_c_idx} 的主来源概率 - A:{max_probs_per_pin[col_A]:.4f}, B:{max_probs_per_pin[col_B]:.4f}, CI:{max_probs_per_pin[col_CI]:.4f}")
-                
-                # ================= [深度时序探针：揭露 AT 概率稀释真相] =================
                 pin_ats = self.model._probe_pin_ats
-                node_ats = self.model._probe_node_ats
-                
-                # 找出全图预期到达时间 (Expected AT) 最大的输入引脚
                 worst_pin_idx = torch.argmax(pin_ats).item()
                 worst_expected_at = pin_ats[worst_pin_idx].item()
-                
-                print(f"\n  🔍 [时序深度穿透] 观测最差引脚 Index: {worst_pin_idx} | 连续域期望 AT: {worst_expected_at:.4f} ns")
-                
-                # 提取该引脚的上游连线概率云
-                probs_to_worst_pin = M[:, worst_pin_idx]
-                top_probs, top_indices = torch.topk(probs_to_worst_pin, 5)
-                
-                expected_at_sum = 0.0
-                for p, src_idx in zip(top_probs, top_indices):
-                    src_at = node_ats[src_idx].item()
-                    contribution = p.item() * src_at
-                    expected_at_sum += contribution
-                    print(f"      [源节点 {src_idx.item():>3d}] 概率: {p.item():.4f} | 真实物理AT: {src_at:.4f} ns -> 被稀释为: {contribution:.4f} ns")
-                
-                print(f"      ... (长尾碎概率贡献总和: {max(0.0, worst_expected_at - expected_at_sum):.4f} ns)")
-                
-                worst_physical_at = node_ats[top_indices[0]].item()
-                print(f"  ⚠️  [物理真相警告] 若此时 Legalizer 强行硬连最大概率线, 该引脚真实 AT 将瞬间暴涨至 -> {worst_physical_at:.4f} ns!\n")
-                # ====================================================================
-                
-                # 清零累加器，准备下一个周期的监控
-                acc_forward, acc_loss, acc_backward, acc_step = 0.0, 0.0, 0.0, 0.0
+                print(f"\n  🔍 [时序深度穿透] 观测最差引脚全局 Index: {worst_pin_idx} | 连续域期望 AT: {worst_expected_at:.4f} ns")
+                print(f"  ⚠️  [架构升级] 局部级联架构已激活，跨级倒流已被物理封锁。")
 
         print("[Optimizer] 训练收敛完成。")
-        return M.detach(), P_c.detach()
+        return [m.detach() for m in local_M_probs], P_c.detach()

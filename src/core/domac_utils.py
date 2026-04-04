@@ -214,7 +214,7 @@ def probe_column_height_overflow(model, discrete_M):
     print("="*60)
 
     # 1. 获取所有节点的列权重属性
-    node_cols = model.node_cols
+    node_cols = model.virtual_node_cols
 
     # 2. 找出流向 Sink (下游 CPA) 的节点
     # 在 discrete_M 中，如果某一行全为 0，说明该节点没有连向任何内部压缩器引脚，必然流向了 Sink
@@ -242,45 +242,36 @@ def probe_column_height_overflow(model, discrete_M):
     print("="*60 + "\n")
 
 # ================= [探针 2：离散化后硬连线物理评估 & WNS 溯源] =================
-def probe_post_legalization_eval(model, loss_engine, trainer_hyperparams, discrete_M, discrete_P, final_P, pp_at, pp_slew, REQ_TIME, PP_COLS, COMP_COLS):
+def probe_post_legalization_eval(model, loss_engine, trainer_hyperparams, discrete_local_M, discrete_P, final_P, pp_at, pp_slew, REQ_TIME, PP_COLS, COMP_COLS):
     print("\n[Evaluator] 正在对坍缩后的 0/1 离散硬连线进行最终物理时序与毛刺功耗核算...")
     with torch.no_grad():
         # 1. 构造离散化物理尺寸的 One-Hot 张量
         discrete_P_tensor = torch.zeros_like(final_P)
         for i, idx in enumerate(discrete_P):
             discrete_P_tensor[i, idx] = 1.0
-            
-        # 2. 构造包含 Sink (CPA) 列的完整离散连线矩阵
-        discrete_M_full = torch.zeros_like(model.m_logits)
-        discrete_M_full[:, :-1] = discrete_M
-        # 匈牙利算法没有分给压缩树的引脚，必定全部流向了最后的 CPA (Sink)
-        row_sums = torch.sum(discrete_M, dim=1)
-        discrete_M_full[row_sums == 0, -1] = 1.0
 
-        # 3. 备份原本训练结束时的模糊 logits
-        orig_m_logits = model.m_logits.clone()
+        # 2. 备份原本训练结束时的模糊 logits，防止污染模型状态
+        orig_local_m_logits = [m.clone() for m in model.local_m_logits]
         orig_p_logits = model.p_logits.clone()
 
-        # 4. [核心技巧] 注入极端 Logits 强制网络走硬连线
-        new_m_logits = torch.full_like(orig_m_logits, -1e4)
-        new_m_logits[discrete_M_full == 1.0] = 1e4
-        model.m_logits.copy_(new_m_logits)
+        # 3. [核心技巧] 注入极端 Logits 强制网络走硬连线 (局部矩阵版)
+        for m_param, m_disc in zip(model.local_m_logits, discrete_local_M):
+            new_m = torch.full_like(m_param, -1e4)
+            new_m[m_disc == 1.0] = 1e4
+            m_param.copy_(new_m)
 
-        new_p_logits = torch.full_like(orig_p_logits, -1e4)
-        new_p_logits[discrete_P_tensor == 1.0] = 1e4
-        model.p_logits.copy_(new_p_logits)
+        new_p = torch.full_like(orig_p_logits, -1e4)
+        new_p[discrete_P_tensor == 1.0] = 1e4
+        model.p_logits.copy_(new_p)
 
-        # 5. 执行一次纯净的前向传播与 Loss 计算
-        # 【修改点 1】增加 eval_glitch 接收毛刺功耗方差
-        eval_wns, eval_tns, eval_area, eval_glitch, eval_M, eval_P = model(pp_at, pp_slew, tau=1.0)
+        # 4. 执行一次纯净的前向传播与 Loss 计算
+        eval_wns, eval_tns, eval_area, eval_glitch, eval_local_M, eval_P = model(pp_at, pp_slew, tau=1.0)
         
-        # 【修改点 2】将 eval_glitch 传给 loss_engine
         eval_loss, eval_dict = loss_engine(
-            eval_wns, eval_tns, eval_area, eval_glitch, eval_M, eval_P, trainer_hyperparams, 
-            model.active_pin_mask, model.c_types
+            eval_wns, eval_tns, eval_area, eval_glitch, eval_local_M, eval_P, 
+            trainer_hyperparams, model.local_meta
         )
 
-        # 【修改点 3】在最终评估报告中打印出 Glitch 的数值
         print(f" -> [坍缩后真实指标] WNS: {eval_dict['wns'].item():.4f} ns | "
               f"Area: {eval_dict['area'].item():.4f} μm² | "
               f"Glitch (Var): {eval_dict['glitch'].item():.6f} | "
@@ -292,7 +283,7 @@ def probe_post_legalization_eval(model, loss_engine, trainer_hyperparams, discre
         print(" 🧮 [DOMAC 探针] 离散化网表 WNS 内部计算逻辑核对")
         print("="*60)
         
-        # 1. 提取离散化评估后的全图所有节点的 AT (到达时间)
+        # 1. 提取离散化评估后的全图所有虚拟节点的 AT (到达时间)
         all_ats = model._probe_node_ats.detach().cpu().numpy()
         req_time = REQ_TIME 
         
@@ -304,7 +295,7 @@ def probe_post_legalization_eval(model, loss_engine, trainer_hyperparams, discre
         worst_at = all_ats[worst_idx]
         worst_slack = slacks[worst_idx]
         
-        # 4. 翻译这个“罪魁祸首”节点的物理身份
+        # 4. 翻译这个“罪魁祸首”节点的物理身份 (已适配 Bypass 虚拟线)
         num_pp = len(PP_COLS)
         num_c = len(COMP_COLS)
         if worst_idx < num_pp:
@@ -312,9 +303,11 @@ def probe_post_legalization_eval(model, loss_engine, trainer_hyperparams, discre
         elif worst_idx < num_pp + num_c:
             c_idx = worst_idx - num_pp
             node_name = f"压缩器 U_comp_{c_idx} 的 S (Sum) 输出引脚"
-        else:
+        elif worst_idx < num_pp + 2 * num_c:
             c_idx = worst_idx - num_pp - num_c
             node_name = f"压缩器 U_comp_{c_idx} 的 CO (Carry-Out) 输出引脚"
+        else:
+            node_name = f"虚拟透传线 (Bypass Wire) ID_{worst_idx}"
             
         print(f" -> 1. 设定的目标到达时间 (REQ_TIME) : {req_time:.4f} ns")
         print(f" -> 2. 全局最慢的关键节点判定为     : {node_name}")
@@ -323,10 +316,11 @@ def probe_post_legalization_eval(model, loss_engine, trainer_hyperparams, discre
         print(f" -> 5. AI 最终汇报的平滑 eval_wns   : {eval_wns.item():.4f} ns")
         print("="*60 + "\n")
 
-        # 6. 恢复原本的 logits (保持代码状态安全)
-        model.m_logits.copy_(orig_m_logits)
+        # 5. 恢复原本的 logits (保持代码状态安全)
+        for m_param, orig_m in zip(model.local_m_logits, orig_local_m_logits):
+            m_param.copy_(orig_m)
         model.p_logits.copy_(orig_p_logits)
-
+        
 # ================= [探针 3：波前到达时间 (Wavefront AT)] =================
 def probe_wavefront_at(model, discrete_M):
     print("\n" + "="*65)
@@ -335,7 +329,7 @@ def probe_wavefront_at(model, discrete_M):
     
     # 提取离散化评估后，全图节点的真实物理到达时间
     node_ats = model._probe_node_ats.detach().cpu().numpy()
-    node_cols = model.node_cols
+    node_cols = model.virtual_node_cols
     
     # 找出流向 Sink 的节点 (行和为 0 的离散 M)
     row_sums = torch.sum(discrete_M, dim=1)
@@ -365,3 +359,117 @@ def probe_wavefront_at(model, discrete_M):
         print(f" Col {col:<10} | {max_at:.4f} ns{'':<16} | {status}")
         
     print("="*65 + "\n")
+
+def build_local_routing_graph(bit_width, pp_cols, c_cols, c_types):
+    """
+    生成局部 M_{i,j} 矩阵所需的层级化物理路由元数据 (严格同步画布逻辑修复版)
+    """
+    num_pp = len(pp_cols)
+    num_c = len(c_cols)
+    max_cols = bit_width * 2
+    
+    # 1. 初始化连线池 (记录全局 Wire ID)
+    wires = [[] for _ in range(max_cols)]
+    for k, col in enumerate(pp_cols):
+        if col >= len(wires):
+            # 应对极其罕见的溢出列
+            wires.extend([[] for _ in range(col - len(wires) + 1)])
+        wires[col].append(k) 
+        
+    dadda_seq = [2]
+    while dadda_seq[-1] < bit_width:
+        dadda_seq.append(int(dadda_seq[-1] * 1.5))
+    dadda_seq.reverse()
+    targets = [t for t in dadda_seq if t < max([len(w) for w in wires])]
+    
+    # 预分配压缩器 ID (使用 defaultdict 防越界)
+    from collections import defaultdict
+    comp_queue = defaultdict(lambda: {'FA': [], 'HA': []})
+    for j, (col, c_type) in enumerate(zip(c_cols, c_types)):
+        comp_queue[col][c_type].append(j)
+    comp_usage = defaultdict(lambda: {'FA': 0, 'HA': 0})
+    
+    routing_stages = []
+    next_wire_id = num_pp + 2 * num_c # Bypass 虚拟线的 ID 从这里开始分配
+    
+    # 2. 逐级生成局部矩阵元数据
+    for target in targets:
+        stage_meta = []
+        next_wires = [[] for _ in range(len(wires))]
+        carry_from_prev = []
+        
+        for col in range(len(wires)):
+            # [核心修复]: Native Wires 才是决定是否需要增加压缩器的基准
+            native_wires = wires[col]
+            in_wires = native_wires + carry_from_prev
+            
+            V = len(native_wires)
+            num_carries_in = len(carry_from_prev)
+            
+            # 为刚刚到来的进位预留位置
+            allowed_output = target - num_carries_in
+            
+            if V > allowed_output:
+                reduction_needed = V - allowed_output
+                f = reduction_needed // 2
+                h = reduction_needed % 2
+                
+                fa_ids, ha_ids, carries_gen, pin_global_indices = [], [], [], []
+                
+                # 分配全加器
+                for _ in range(f):
+                    c_id = comp_queue[col]['FA'][comp_usage[col]['FA']]
+                    comp_usage[col]['FA'] += 1
+                    fa_ids.append(c_id)
+                    next_wires[col].append(num_pp + c_id)             # S 输出
+                    carries_gen.append(num_pp + num_c + c_id)         # CO 输出
+                    pin_global_indices.extend([c_id*3, c_id*3+1, c_id*3+2])
+                    
+                # 分配半加器
+                for _ in range(h):
+                    c_id = comp_queue[col]['HA'][comp_usage[col]['HA']]
+                    comp_usage[col]['HA'] += 1
+                    ha_ids.append(c_id)
+                    next_wires[col].append(num_pp + c_id)
+                    carries_gen.append(num_pp + num_c + c_id)
+                    pin_global_indices.extend([c_id*3, c_id*3+1])
+                    
+                # 剩余的信号走透传 Bypass 通道
+                num_bypass = len(in_wires) - (f * 3 + h * 2)
+                out_bypass_ids = []
+                for _ in range(num_bypass):
+                    out_bypass_ids.append(next_wire_id)
+                    next_wires[col].append(next_wire_id)
+                    next_wire_id += 1
+                    
+                stage_meta.append({
+                    'col': col, 'in_wires': in_wires, 'fa_ids': fa_ids, 'ha_ids': ha_ids,
+                    'out_bypass_ids': out_bypass_ids, 'pin_global_indices': pin_global_indices
+                })
+                # 本列生成的进位传给下一列
+                carry_from_prev = carries_gen
+                
+            else:
+                # 如果不需要压缩，所有进来的信号 (原生 + 进位) 全部走 Bypass
+                num_bypass = len(in_wires)
+                out_bypass_ids = []
+                for _ in range(num_bypass):
+                    out_bypass_ids.append(next_wire_id)
+                    next_wires[col].append(next_wire_id)
+                    next_wire_id += 1
+                    
+                if num_bypass > 0:
+                    stage_meta.append({
+                        'col': col, 'in_wires': in_wires, 'fa_ids': [], 'ha_ids': [],
+                        'out_bypass_ids': out_bypass_ids, 'pin_global_indices': []
+                    })
+                carry_from_prev = []
+                
+        # 处理最高位溢出的进位
+        if carry_from_prev:
+            next_wires.append(carry_from_prev)
+            
+        routing_stages.append(stage_meta)
+        wires = next_wires
+        
+    return routing_stages, next_wire_id
