@@ -170,7 +170,7 @@ def main():
     print("\n[Engine] 物理映射与梯度反向传播开始...")
     
     start_time = time.time()
-    final_M, final_P = trainer.train(pp_at, pp_slew, max_epochs=270)
+    final_M, final_P = trainer.train(pp_at, pp_slew, max_epochs=600)
     
     print("\n[System] 优化执行完毕！网表拓扑已坍缩至离散界限附近。")
     

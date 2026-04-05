@@ -22,9 +22,20 @@ def diff_bilinear_interp(slew, load, index_1_slew, index_2_load, lut_values):
     """
     x_min, x_max = index_1_slew[0], index_1_slew[-1]
     y_min, y_max = index_2_load[0], index_2_load[-1]
+
     
-    x = torch.clamp(slew, min=x_min, max=x_max)
-    y = torch.clamp(load, min=y_min, max=y_max)
+    # 统计有多少个元素的真实值超出了 LUT 的边界
+    slew_overflow = (slew > x_max).sum().item()
+    load_overflow = (load > y_max).sum().item()
+    
+    if slew_overflow > 0 or load_overflow > 0:
+        print(f"  [梯度消失警告] {slew_overflow} 个 Slew, {load_overflow} 个 Load 触发了 Clamp 截断，梯度已断裂！")
+        
+    x = torch.clamp(slew, min=index_1_slew[0], max=x_max)
+    y = torch.clamp(load, min=index_2_load[0], max=y_max)
+
+    # x = torch.clamp(slew, min=x_min, max=x_max)
+    # y = torch.clamp(load, min=y_min, max=y_max)
 
     idx_x = torch.searchsorted(index_1_slew, x)
     idx_y = torch.searchsorted(index_2_load, y)

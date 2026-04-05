@@ -181,6 +181,10 @@ class NLDMParser:
                         'index_2_load': torch.tensor(idx2, dtype=torch.float32),
                         'delay_lut': torch.tensor(delay_worst, dtype=torch.float32),
                         'slew_lut': torch.tensor(slew_worst, dtype=torch.float32)
+                        # 'delay_rise_lut': torch.tensor(tables['cell_rise']['values'], dtype=torch.float32),
+                        # 'delay_fall_lut': torch.tensor(tables['cell_fall']['values'], dtype=torch.float32),
+                        # 'slew_rise_lut': torch.tensor(tables['rise_transition']['values'], dtype=torch.float32),
+                        # 'slew_fall_lut': torch.tensor(tables['fall_transition']['values'], dtype=torch.float32),
                     }
             print(f" -> 成功编译物理单元: {cell}")
             

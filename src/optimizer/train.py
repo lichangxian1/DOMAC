@@ -19,12 +19,12 @@ class DOMACTrainer:
 
         self.hyperparams = {
             't1': 1.45,     # WNS 权重拉到极致，逼迫网络突破延迟极限
-            't2': 0.0,       # TNS 辅助全局路径寻优
-            'alpha': 0,    # 【封印】前期绝对不许管面积！
-            'lambda1': 0.0,  # 连线合法性是必须的
-            'lambda2': 0.0,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
-            'tau_k':0.995,
-            'beta': 0.00,  
+            't2': 0.4,       # TNS 辅助全局路径寻优
+            'alpha': 1,    # 【封印】前期绝对不许管面积！
+            'lambda1': 0.66,  # 连线合法性是必须的
+            'lambda2': 0.24,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
+            'tau_k':1,
+            'beta': 0.0,  
         }
         
         # self.hyperparams = {
@@ -38,22 +38,37 @@ class DOMACTrainer:
         # }
  
     def update_hyperparameters(self, epoch):
-        if 100 <= epoch < 200:
-            self.hyperparams['t1'] *= 1.005       # WNS (Performance) 绝对优先，持续缓慢施压
-            self.hyperparams['t2'] *= 1.005
-            self.hyperparams['beta'] *= 1.01      # [修复点] 将 1.05 降到 1.01，温和引入功耗惩罚，平滑到达时间
-            self.hyperparams['lambda1'] *= 1.01   # 连线合法性必须逐步收紧
-            self.hyperparams['lambda2'] *= 1.01
+        # 阶段一：纯粹的 WNS 拓扑探索 (Epoch 0 ~ 150)
+        # alpha, lambda1, lambda2 保持极低或初始状态，beta = 0
+        if epoch < 150:
+            pass 
+            
+        # 阶段二：面积回收与强制离散化 (Epoch 150 ~ 450)
+        elif 150 <= epoch < 450:
+            self.hyperparams['alpha'] *= 1.005    # 开始施压清理冗余面积
+            self.hyperparams['t1'] *= 1.002       # WNS 继续缓慢施压
+            self.hyperparams['lambda1'] *= 1.02   # 收紧合法性
+            self.hyperparams['lambda2'] *= 1.05   # 暴力逼迫二值化
+            # beta 依然为 0
+            
+        # 阶段三：极寒物理微调与毛刺消除 (Epoch 450 ~ 500)
+        else:
+            if epoch == 450:
+                print("\n[Scheduler] 进入极寒固化期！唤醒毛刺消除引擎 (Beta)")
+                self.hyperparams['beta'] = 0.5    # 突然施加毛刺惩罚！
+            
+            self.hyperparams['lambda2'] *= 1.01   # 维持二值化压力
+            self.hyperparams['beta'] *= 1.02      # 缓慢增加防毛刺力度
+
             # 核心逻辑：此阶段 alpha (面积) 保持冰封或原样，给功耗优化留出绝对的空间
 
-        # 阶段 3 (Epoch 200 之后): 面积回收与物理坍缩
-        elif epoch >= 200:
-            self.hyperparams['t1'] *= 1.005       # 时序霸权不可动摇
-            self.hyperparams['t2'] *= 1.005
-            self.hyperparams['beta'] *= 1.002     # 功耗压制转为平稳维持（防暴涨）
-            self.hyperparams['alpha'] *= 1.01     # 面积 (Area) 垫底，此时才开始发力清理冗余逻辑门
-            self.hyperparams['lambda1'] *= 1.02   # 逼近 Legalizer，增强合法性惩罚
-            self.hyperparams['lambda2'] *= 1.05   # 终极二值化施压，逼迫概率走向 0 或 1
+        # # 阶段 3 (Epoch 200 之后): 面积回收与物理坍缩
+        # elif epoch >= 200:
+        #     self.hyperparams['alpha'] *= 1.003
+        #     self.hyperparams['t1'] *= 1.005
+        #     self.hyperparams['t2'] *= 1.005
+        #     self.hyperparams['lambda1'] *= 1.02   # 逼近 Legalizer，增强合法性惩罚
+        #     self.hyperparams['lambda2'] *= 1.05   # 终极二值化施压，逼迫概率走向 0 或 1
     # def update_hyperparameters(self, epoch):
     #     """
     #     动态退火调度器：分阶段释放约束
@@ -91,8 +106,16 @@ class DOMACTrainer:
             # ================= [新增：极其暴力的温度退火] =================
             # 指数级降温：Epoch 0 时 tau=1.0，Epoch 300 时 tau 接近 0.05
             # 这会把 AI 伪造的 "冰块概率" 强行压成 0，暴露出真实的延迟！
-            current_tau_k = self.hyperparams.get('tau_k')
-            current_tau = max(0.05, 1.0 * (current_tau_k ** epoch))
+            # current_tau_k = self.hyperparams.get('tau_k')
+            # 手动控制三段式温度
+            # 在 train 函数的 tau 调度中：
+            if epoch < 150:
+                current_tau = 1.0
+            elif epoch < 450:
+                current_tau = max(0.01, 1.0 * (0.985 ** (epoch - 150))) # 加快降温，探底 0.01
+            else:
+                current_tau = 0.01 # 绝对零度
+            # current_tau = max(0.05, 1.0 * (current_tau_k ** epoch))
             # current_tau = 1
             # # ================= [修复：三段式科学退火调度] =================
             # if epoch < 60:
