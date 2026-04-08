@@ -18,15 +18,14 @@ class DOMACTrainer:
         # ])
 
         self.hyperparams = {
-            't1': 1.45,     # WNS 权重拉到极致，逼迫网络突破延迟极限
-            't2': 0.4,       # TNS 辅助全局路径寻优
-            'alpha': 1,    # 【封印】前期绝对不许管面积！
-            'lambda1': 0.66,  # 连线合法性是必须的
-            'lambda2': 0.24,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
-            'tau_k':0.985,
-            'beta': 0.00125,  
+            't1': 1.0,         # WNS 權重：論文設定初始值為 1 
+            't2': 0.01,        # TNS 權重：論文設定初始值為 0.01 
+            'alpha': 1.0,      # 面積權重：論文建議設定在 1 到 5 之間，這裡取 1.0 
+            'lambda1': 0.1,    # 連線合法性 (L_BM) 權重：論文設定初始值為 0.1 
+            'lambda2': 0.5,    # 二值化 (L_D) 權重：論文設定初始值為 0.5 
+            'tau_k': 1,    # (保留您原有的溫度退火設定，論文中未特別指出 Softmax 的溫度調度)
+            'beta': 0.0,       # (毛刺功耗是您的原創加入，原論文中並無此項，為求嚴格還原，此處設為 0.0)
         }
-        
         # self.hyperparams = {
         #     't1': 3.4,     # WNS 权重拉到极致，逼迫网络突破延迟极限
         #     't2': 0.35,       # TNS 辅助全局路径寻优
@@ -38,22 +37,23 @@ class DOMACTrainer:
         # }
  
     def update_hyperparameters(self, epoch):
-        if 100 <= epoch < 200:
-            self.hyperparams['t1'] *= 1.005       # WNS (Performance) 绝对优先，持续缓慢施压
+        """
+        DOMAC 官方退火調度器 (嚴格遵循原文 III-F 章節設定)
+        優化過程共 300 次迭代，從第 100 次開始進行增量調整。
+        """
+        if epoch >= 100:
+            # 面積權重 (alpha)：每次迭代增加 0.3% 以平衡後期的時序優化 
+            self.hyperparams['alpha'] *= 1.003
+            
+            # 性能權重 (t1, t2)：每次迭代增加 0.5% 以在後期優先優化時序 
+            self.hyperparams['t1'] *= 1.005
             self.hyperparams['t2'] *= 1.005
-            self.hyperparams['beta'] *= 1.01      # [修复点] 将 1.05 降到 1.01，温和引入功耗惩罚，平滑到达时间
-            self.hyperparams['lambda1'] *= 1.01   # 连线合法性必须逐步收紧
+            
+            # 約束權重 (lambda1, lambda2)：每次迭代增加 1% 以確保設計約束被充分遵守 
+            self.hyperparams['lambda1'] *= 1.01
             self.hyperparams['lambda2'] *= 1.01
-            # 核心逻辑：此阶段 alpha (面积) 保持冰封或原样，给功耗优化留出绝对的空间
-
-        # 阶段 3 (Epoch 200 之后): 面积回收与物理坍缩
-        elif epoch >= 200:
-            self.hyperparams['t1'] *= 1.005       # 时序霸权不可动摇
-            self.hyperparams['t2'] *= 1.005
-            self.hyperparams['beta'] = min(self.hyperparams['beta'] * 1.002, 5.0)
-            self.hyperparams['alpha'] = min(self.hyperparams['alpha'] * 1.01, 10.0) 
-            self.hyperparams['lambda1'] = min(self.hyperparams['lambda1'] * 1.02, 20.0)
-            self.hyperparams['lambda2'] = min(self.hyperparams['lambda2'] * 1.05, 50.0) 
+            
+            # self.hyperparams['beta'] *= 1.0  # (若要開啟毛刺優化，可在此處自行定義增長率)
     # def update_hyperparameters(self, epoch):
     #     """
     #     动态退火调度器：分阶段释放约束
@@ -177,6 +177,9 @@ class DOMACTrainer:
                 worst_expected_at = pin_ats[worst_pin_idx].item()
                 print(f"\n  🔍 [时序深度穿透] 观测最差引脚全局 Index: {worst_pin_idx} | 连续域期望 AT: {worst_expected_at:.4f} ns")
                 print(f"  ⚠️  [架构升级] 局部级联架构已激活，跨级倒流已被物理封锁。")
-
+                # ==============================================================
+                # [核心修复]：在这里把累加器清零！否则下个周期的平均时间会越加越大
+                acc_forward, acc_loss, acc_backward, acc_step = 0.0, 0.0, 0.0, 0.0
+                # ==============================================================
         print("[Optimizer] 训练收敛完成。")
         return [m.detach() for m in local_M_probs], P_c.detach()
