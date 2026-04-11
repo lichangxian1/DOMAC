@@ -61,32 +61,32 @@ def main():
             parser = NLDMParser(lib_path, TARGET_CELLS)
             nldm_db = parser.parse()
 
-            print("\n" + "="*60)
-            print(" 📊 [物理数据核对] 提取的 Area, Cap 与 Delay 全景概览")
-            print("="*60)
-            for cell in TARGET_CELLS:
-                if cell in nldm_db:
-                    area = nldm_db[cell].get('cell_area', 'N/A')
-                    print(f"[{cell}]")
-                    print(f"  -> 面积 (Area): {area} μm²")
+            # print("\n" + "="*60)
+            # print(" 📊 [物理数据核对] 提取的 Area, Cap 与 Delay 全景概览")
+            # print("="*60)
+            # for cell in TARGET_CELLS:
+            #     if cell in nldm_db:
+            #         area = nldm_db[cell].get('cell_area', 'N/A')
+            #         print(f"[{cell}]")
+            #         print(f"  -> 面积 (Area): {area} μm²")
                     
-                    if 'pin_cap' in nldm_db[cell]:
-                        print(f"  -> 引脚输入电容 (Input Capacitance):")
-                        for pin, cap in nldm_db[cell]['pin_cap'].items():
-                            print(f"     * {pin:<3} : {cap:.6f} pF") 
-                    else:
-                        print(f"  -> [Warning] 未发现引脚电容数据！")
+            #         if 'pin_cap' in nldm_db[cell]:
+            #             print(f"  -> 引脚输入电容 (Input Capacitance):")
+            #             for pin, cap in nldm_db[cell]['pin_cap'].items():
+            #                 print(f"     * {pin:<3} : {cap:.6f} pF") 
+            #         else:
+            #             print(f"  -> [Warning] 未发现引脚电容数据！")
                     
-                    for out_pin in ['S', 'CO']:
-                        if out_pin in nldm_db[cell]:
-                            for in_pin in ['A', 'B', 'CI']:
-                                if in_pin in nldm_db[cell][out_pin]:
-                                    arc_data = nldm_db[cell][out_pin][in_pin]
-                                    delay_lut = arc_data.get('delay_lut')
-                                    if delay_lut is not None:
-                                        print(f"  -> {in_pin} -> {out_pin:<2} 延迟极限: {delay_lut.min().item():.5f} ~ {delay_lut.max().item():.5f} ns")
-                    print("-" * 40)
-            print("="*60 + "\n")
+            #         for out_pin in ['S', 'CO']:
+            #             if out_pin in nldm_db[cell]:
+            #                 for in_pin in ['A', 'B', 'CI']:
+            #                     if in_pin in nldm_db[cell][out_pin]:
+            #                         arc_data = nldm_db[cell][out_pin][in_pin]
+            #                         delay_lut = arc_data.get('delay_lut')
+            #                         if delay_lut is not None:
+            #                             print(f"  -> {in_pin} -> {out_pin:<2} 延迟极限: {delay_lut.min().item():.5f} ~ {delay_lut.max().item():.5f} ns")
+            #         print("-" * 40)
+            # print("="*60 + "\n")
             
             fa_tensors = [nldm_db[c] for c in TARGET_CELLS if c.startswith('FA') and c in nldm_db]
             ha_tensors = [nldm_db[c] for c in TARGET_CELLS if c.startswith('HA') and c in nldm_db]
@@ -96,7 +96,7 @@ def main():
         print(f"\n[Fatal Error] 系统初始化失败，拒绝以非严谨模式运行。原因: {e}")
         sys.exit(1)
         
-    BIT_WIDTH = 12
+    BIT_WIDTH = 8
     TARGET_SINK_COUNT = (BIT_WIDTH * 2 - 1) * 2
     # 接收包含物理延迟的 4 个返回值
     if USE_BOOTH:
@@ -241,7 +241,6 @@ def main():
     end_time = time.time()
     print("="*60)
     print(f" [任务完成] 全流程跑通，总耗时: {end_time - start_time:.2f} 秒")
-    print(f" 请前往 output/netlists/domac_result.v 查看流片网表。")
     print("="*60)
 
     print("\n[System] 启动跨服传输，正在将网表发射至 GPU 仿真服务器...")
@@ -256,7 +255,6 @@ def main():
         subprocess.run(rsync_cmd, check=True)
         print("="*60)
         print("[System] 🚀 跨服投递成功！")
-        print("所有 RTL 网表已安全降落在 powerSimPlatform/src/rtl/ 目录下，准备好进行功耗评估！")
         print("="*60)
     except subprocess.CalledProcessError as e:
         print(f"\n[Fatal Error] 传输任务坠毁！rsync 返回了非零状态码: {e.returncode}")

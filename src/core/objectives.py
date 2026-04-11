@@ -64,11 +64,26 @@ class DOMACLossFunction(nn.Module):
             
         return torch.sum((actual_in_signals - expected_pins) ** 2)
     
+    # def calc_discretization_loss(self, tensor):
+    #     """
+    #     3. 二值化驱动损失 (Discretization Loss L_D)
+    #     """
+    #     return torch.sum((tensor ** 2) * ((1.0 - tensor) ** 2))
     def calc_discretization_loss(self, tensor):
         """
-        3. 二值化驱动损失 (Discretization Loss L_D)
+        3. 终极二值化驱动：平方和集中度损失 (Gini Impurity / L2 Norm Maximization)
+        利用 Softmax 守恒律，直接促使概率矩阵向 One-Hot 坍缩，无需退火算法！
         """
-        return torch.sum((tensor ** 2) * ((1.0 - tensor) ** 2))
+        # tensor shape: [total_nodes, total_target_pins]
+        # 对每一行（每一个源节点流出的概率）计算平方和
+        # 理想的 One-Hot 状态下，行平方和等于 1；均匀分布时极小。
+        row_sq_sum = torch.sum(tensor ** 2, dim=1)
+        
+        # 目标是最大化平方和，等价于最小化 (1 - sq_sum)
+        loss_per_row = 1.0 - row_sq_sum
+        
+        # 返回全局的总惩罚
+        return torch.sum(loss_per_row)
 
     def calc_sink_loss(self, M_internal, target_max_signals):
         """
@@ -118,8 +133,10 @@ class DOMACLossFunction(nn.Module):
         l_bm_norm = l_bm / (l_bm.detach() + 1e-5)
         l_d_norm = l_d / (l_d.detach() + 1e-5)
         l_sink_norm = l_sink / (l_sink.detach() + 1e-5)
-        total_loss = l_perf + lambda1 * l_bm_norm + lambda2 * l_d_norm + l_sink_norm
-        
+        # total_loss = l_perf + lambda1 * l_bm_norm + lambda2 * l_d_norm + l_sink_norm
+        # 核心代码修正 (src/core/objectives.py)
+        # 删除归一化操作，直接使用原始标量
+        total_loss = l_perf + lambda1 * l_bm + lambda2 * l_d + l_sink     
         loss_dict = {
             'total_loss': total_loss,
             'l_perf': l_perf,

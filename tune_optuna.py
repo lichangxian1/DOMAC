@@ -151,6 +151,15 @@ def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_co
             'lr': 0.05
         }
         
+        max_bounds = {
+            't1_max': trial.suggest_float('t1_max', 10, 50, step=5),     # WNS 权重上限，过高可能导致训练不稳定，过低可能限制性能提升
+            'alpha_max': 0.1,
+            'lambda1_max': trial.suggest_float('lambda1_max', 1.0, 10.0, step=0.1),   # 足够让 L_BM 降到 0，又不会反噬
+            'lambda2_max': trial.suggest_float('lambda2_max', 1, 15, step=0.1),  # L_D 本身数值很大(~150)，权重只需 0.15 就能产生 ~20 的惩罚
+            'tau_min': 1,       # 最低温度 0.1 足够完成极化
+            'beta_max': trial.suggest_float('beta_max', 0.5, 10, step=0.1)       # 毛刺惩罚适可而止
+        }
+
         # param_combination = {
         #     't1': 1.5,     # WNS 权重拉到极致，逼迫网络突破延迟极限
         #     't2': 0.223,       # TNS 辅助全局路径寻优
@@ -206,7 +215,8 @@ def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_co
 
                 loss_engine = DOMACLossFunction(target_sink_count=target_sink_count)
                 trainer = DOMACTrainer(model, loss_engine, lr=param_combination['lr'])
-                trainer.hyperparams.update(param_combination)
+                # trainer.hyperparams.update(param_combination)
+                trainer.max_bounds.update(max_bounds)
 
                 # 【核心修复】将真实物理延迟作为 Tensor 喂给 AI
                 # pp_at = torch.tensor(pp_at_init, dtype=torch.float32, device=device)

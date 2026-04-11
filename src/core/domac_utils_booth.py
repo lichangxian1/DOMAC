@@ -1,6 +1,7 @@
 # domac_utils.py
 import torch
 import numpy as np
+from collections import Counter
 
 def create_physical_tensor_mock():
     idx_slew = torch.tensor([0.005, 0.01, 0.02, 0.04, 0.08, 0.16, 0.32], dtype=torch.float32)

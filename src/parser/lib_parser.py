@@ -186,8 +186,6 @@ class NLDMParser:
                         # 'slew_rise_lut': torch.tensor(tables['rise_transition']['values'], dtype=torch.float32),
                         # 'slew_fall_lut': torch.tensor(tables['fall_transition']['values'], dtype=torch.float32),
                     }
-            print(f" -> 成功编译物理单元: {cell}")
-            
         return tensor_db
 
 # ================= 单元测试与入口 =================
