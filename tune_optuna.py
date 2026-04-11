@@ -160,20 +160,6 @@ def optuna_worker_process(storage_url, study_name, fa_tensors, ha_tensors, pp_co
             'beta_max': trial.suggest_float('beta_max', 0.5, 10, step=0.1)       # 毛刺惩罚适可而止
         }
 
-        # param_combination = {
-        #     't1': 1.5,     # WNS 权重拉到极致，逼迫网络突破延迟极限
-        #     't2': 0.223,       # TNS 辅助全局路径寻优
-        #     'alpha': 1,    # 【封印】前期绝对不许管面积！
-        #     'lambda1': 0.2,  # 连线合法性是必须的
-        #     'lambda2': 0.2,  # 【封印】前期不许进行二值化坍缩！让概率保持连续，充分探索！
-        #     'tau_k':0.995,
-        #     'seed': 42,
-        #     'max_epochs':300,
-        #     'init_noise_std': 0.01,
-        #     'beta': trial.suggest_float('beta', 0.0001,0.01),     # 新增：毛刺功耗权重，适度关注毛刺下降但不至于过早牺牲性能
-        #     'lr': trial.suggest_float('lr', 0.01, 0.1, log=True)
-        # }
-
         FIXED_SEED = param_combination['seed']
         torch.manual_seed(FIXED_SEED)
         if torch.cuda.is_available():
@@ -289,10 +275,10 @@ def main():
     TARGET_WEIGHTS = {
         'wns': 1, 
         'area': 0.0000, 
-        'glitch': 0 
+        'glitch': 1
     }
     
-    print(f" [Target] 当前优化目标权重: WNS({TARGET_WEIGHTS.get('wns', 0)}), Area({TARGET_WEIGHTS.get('area', 0)}), Glitch({TARGET_WEIGHTS.get('glitch', 0)})")
+    # print(f" [Target] 当前优化目标权重: WNS({TARGET_WEIGHTS.get('wns', 0)}), Area({TARGET_WEIGHTS.get('area', 0)}), Glitch({TARGET_WEIGHTS.get('glitch', 0)})")
     
     if USE_BOOTH:
         print(" [Mode] 当前模式: Booth 模式")
@@ -306,7 +292,7 @@ def main():
         nldm_db = parser.parse()
         fa_tensors = [nldm_db[c] for c in TARGET_CELLS if c.startswith('FA')]
         ha_tensors = [nldm_db[c] for c in TARGET_CELLS if c.startswith('HA')]
-        BIT_WIDTH = 12
+        BIT_WIDTH = 16
         # 接收包含物理延迟的 4 个返回值
         if USE_BOOTH:
             pp_cols, comp_cols, c_types, PP_AT_INIT = generate_multiplier_canvas(BIT_WIDTH)
@@ -314,7 +300,7 @@ def main():
             pp_cols, comp_cols, c_types = generate_multiplier_canvas(BIT_WIDTH)
 
     TOTAL_TRIALS = 500
-    CONCURRENT_WORKERS = 6
+    CONCURRENT_WORKERS = 3
     
     trials_per_worker = [TOTAL_TRIALS // CONCURRENT_WORKERS + (1 if x < TOTAL_TRIALS % CONCURRENT_WORKERS else 0) for x in range(CONCURRENT_WORKERS)]
 

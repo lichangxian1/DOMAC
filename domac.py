@@ -88,6 +88,7 @@ def main():
             #         print("-" * 40)
             # print("="*60 + "\n")
             
+            # 确保所有目标门类型都成功解析
             fa_tensors = [nldm_db[c] for c in TARGET_CELLS if c.startswith('FA') and c in nldm_db]
             ha_tensors = [nldm_db[c] for c in TARGET_CELLS if c.startswith('HA') and c in nldm_db]
         else:
@@ -96,7 +97,7 @@ def main():
         print(f"\n[Fatal Error] 系统初始化失败，拒绝以非严谨模式运行。原因: {e}")
         sys.exit(1)
         
-    BIT_WIDTH = 8
+    BIT_WIDTH = 16
     TARGET_SINK_COUNT = (BIT_WIDTH * 2 - 1) * 2
     # 接收包含物理延迟的 4 个返回值
     if USE_BOOTH:
@@ -106,7 +107,7 @@ def main():
     NUM_PP = len(PP_COLS)
     NUM_COMPRESSORS = len(COMP_COLS)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cpu')
     print(f"\n[System] 核心计算引擎将挂载至: {device}")
     if torch.cuda.is_available():
         print(f" -> 检测到显卡: {torch.cuda.get_device_name(0)}")
@@ -123,6 +124,7 @@ def main():
 
     print(f"\n[Engine] 构建异构可微压缩树...")
     max_impls = max(len(fa_tensors), len(ha_tensors))
+    # 【重要修复】Dadda 热启动必须保证基准门类型在可用门列表中，否则会越界访问导致训练崩溃。这里设置一个安全的基准门索引，确保即使只有一种门也能正确初始化。
     BASELINE_GATE_INDEX = 1 
     safe_gate_idx = BASELINE_GATE_INDEX if max_impls > BASELINE_GATE_INDEX else 0
 
@@ -195,12 +197,13 @@ def main():
         PP_COLS=PP_COLS, 
         COMP_COLS=COMP_COLS
     )
+    # ============================================================================
 
     # ================= [探针 3：波前到达时间 (Wavefront AT) 探针] =================
     probe_wavefront_at(model=model, discrete_M=discrete_M)
+    # ============================================================================
 
-    # ==============================================================================
-
+    # ================= [网表生成与跨服传输] =================
     os.makedirs("output/netlists", exist_ok=True)
     
     v_gen = VerilogGenerator(
@@ -212,10 +215,8 @@ def main():
     )
     
     netlist_path = f"output/netlists/domac_tree_{BIT_WIDTH}.v"
-    # tb_path = "output/netlists/tb_domac_.v"
     
     v_gen.generate(discrete_M, discrete_P, output_file=netlist_path)
-    # v_gen.generate_testbench(tb_file=tb_path, netlist_file=netlist_path)
     
     top_path = f"output/netlists/domac_{BIT_WIDTH}.v"
     v_gen.generate_multiplier_top(

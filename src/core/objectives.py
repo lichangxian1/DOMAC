@@ -3,23 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class DOMACLossFunction(nn.Module):
-    # def __init__(self, pin_counts_lib=[3.0, 2.0]):
-    #     """
-    #     DOMAC 联合目标与约束损失函数引擎
-    #     """
-    #     super(DOMACLossFunction, self).__init__()
-    #     self.pin_counts = torch.tensor(pin_counts_lib, dtype=torch.float32)
     def __init__(self, target_sink_count, pin_counts_lib=[3.0, 2.0]): # 接收动态目标
         super(DOMACLossFunction, self).__init__()
         self.target_sink_count = target_sink_count
         self.pin_counts = torch.tensor(pin_counts_lib, dtype=torch.float32)
 
-    # def calc_performance_loss(self, wns, tns, area, t1, t2, alpha):
-    #     """
-    #     1. 性能驱动损失 (Performance Objective)
-    #     """
-    #     return t1 * wns + t2 * tns + alpha * area
-    # def calc_performance_loss(self, wns, tns, area, t1, t2, alpha):
     def calc_performance_loss(self, wns, tns, area, glitch, t1, t2, alpha, beta):
         """
         1. 性能驱动损失 (Performance Objective)
